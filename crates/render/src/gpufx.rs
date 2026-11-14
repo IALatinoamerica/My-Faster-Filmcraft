@@ -31,7 +31,7 @@ pub struct Resample {
 
 impl Resample {
     /// Whether the GPU shader reproduces this resample: finite numbers, and not the CPU's mip path.
-    fn gpu_ok(&self) -> bool {
+    pub(crate) fn gpu_ok(&self) -> bool {
         self.rect[0] != u32::MAX
             && self.opacity.is_finite()
             && self.inv.as_ref().is_none_or(|m| [m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite() && v.abs() < 1e7))
@@ -239,6 +239,11 @@ pub enum FxOp {
     ResampleBlur {
         samples: Vec<Resample>,
     },
+    LumaKey(crate::gpufx_more::LumaKey),
+    RoundedCrop(crate::gpufx_more::RoundedCrop),
+    DropShadow(crate::gpufx_more::DropShadow),
+    Noise(crate::gpufx_more::Noise),
+    UltraKey(crate::gpufx_more::UltraKey),
 }
 
 /// Effect ids [`FxOp::eval`] understands (the GPU-capable standard effects).
@@ -279,6 +284,12 @@ pub const GPU_EFFECTS: &[&str] = &[
     "vignette",
     "video_limiter",
     "lumetri",
+    "luma_key",
+    "rounded_crop",
+    "drop_shadow",
+    "noise",
+    "noise_legacy",
+    "ultra_key",
 ];
 
 /// Pictures a Transform with its own shutter angle is blurred over.
@@ -311,7 +322,7 @@ fn transform_resample(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Res
 }
 
 /// `Image::transformed` without the mip path: the destination rectangle it writes and the inverse.
-fn resample(w: usize, h: usize, m: &Affine, opacity: f32) -> Resample {
+pub(crate) fn resample(w: usize, h: usize, m: &Affine, opacity: f32) -> Resample {
     let Some(inv) = m.inverse() else { return Resample { inv: None, rect: [0; 4], opacity } };
     let b = m.bounds(&filmcraft_geom::Rect::new(0.0, 0.0, w as f64, h as f64));
     let y0 = (b.y.floor().max(0.0) as usize).min(h);
@@ -553,6 +564,11 @@ impl FxOp {
                 }
                 FxOp::ResampleBlur { samples }
             }
+            "luma_key" => FxOp::LumaKey(crate::gpufx_more::LumaKey::eval(e, cx)),
+            "rounded_crop" => FxOp::RoundedCrop(crate::gpufx_more::RoundedCrop::eval(e, cx, w, h)),
+            "drop_shadow" => FxOp::DropShadow(crate::gpufx_more::DropShadow::eval(e, cx, w, h)),
+            "noise" | "noise_legacy" => FxOp::Noise(crate::gpufx_more::Noise::eval(e, cx)),
+            "ultra_key" => FxOp::UltraKey(crate::gpufx_more::UltraKey::eval(e, cx, w, h)),
             "horizontal_flip" => FxOp::HFlip,
             "vertical_flip" => FxOp::VFlip,
             "mirror" => {
@@ -768,6 +784,11 @@ impl FxOp {
                     && fin(&[*va, *vmid, *vround, *vfeather, *aspect])
             }
             FxOp::Mask { .. } => true,
+            FxOp::LumaKey(k) => k.gpu_ok(),
+            FxOp::RoundedCrop(c) => c.gpu_ok(),
+            FxOp::DropShadow(d) => d.gpu_ok(),
+            FxOp::Noise(n) => n.gpu_ok(),
+            FxOp::UltraKey(k) => k.gpu_ok(),
         }
     }
 
@@ -1060,6 +1081,11 @@ impl FxOp {
                     dec(crate::vfx::lerp3(v, target, k))
                 });
             }
+            FxOp::LumaKey(k) => k.apply(img),
+            FxOp::RoundedCrop(c) => c.apply(img),
+            FxOp::DropShadow(d) => d.apply(img),
+            FxOp::Noise(n) => n.apply(img),
+            FxOp::UltraKey(k) => k.apply(img),
             FxOp::Mask { cov } => {
                 if cov.len().checked_mul(4) == Some(img.px.len()) {
                     crate::mask::scale_by(img, cov);
@@ -1274,7 +1300,7 @@ pub(crate) fn limit(v: [f32; 3], max: f32, comp: f32, axis: u32) -> [f32; 3] {
 }
 
 /// The body of `Image::transformed` (no mip path) for a precomputed inverse and rectangle.
-fn resample_cpu(src: &Image, inv: &Affine, rect: [u32; 4]) -> Image {
+pub(crate) fn resample_cpu(src: &Image, inv: &Affine, rect: [u32; 4]) -> Image {
     let (w, h) = (src.w, src.h);
     let mut out = Image::new(w, h);
     let [x0, x1, y0, y1] = rect.map(|v| v as usize);

@@ -29,16 +29,18 @@ Notes from the baseline:
 full-frame adjustment layer over the whole sequence (copies of `SHORT TEST.fcproj`). 10 s from
 5 s at Full; frames shown of 600.
 
-| Project | After 02 | After 06 |
-|---|---|---|
-| Luma Key CAM | 0 | 145 |
-| Rounded Crop CAM | 4 | 247 |
-| Noise CAM | 1 | 23 |
-| Twirl CAM | 1 | 2 |
-| Ultra Key CAM | 0 | 2 |
-| Ultra Key Soft CAM | 0 | 0 |
-| Drop Shadow CAM | 0 | 0 |
-| every ADJ project | 0 | 0 |
+| Project | After 02 | After 06 | After 07 |
+|---|---|---|---|
+| Luma Key CAM / ADJ | 0 / 0 | 145 / 0 | 516 / 491 |
+| Rounded Crop CAM / ADJ | 4 / 0 | 247 / 0 | 518 / 511 |
+| Noise CAM / ADJ | 1 / 0 | 23 / 0 | 495 / 490 |
+| Ultra Key CAM / ADJ | 0 / 0 | 2 / 0 | 517 / 494 |
+| Ultra Key Soft CAM / ADJ (choke and soften) | 0 / 0 | 0 / 0 | 511 / 517 |
+| Drop Shadow CAM / ADJ | 0 / 0 | 0 / 0 | 503 / 510 |
+| Twirl CAM / ADJ (no GPU version) | 1 / 0 | 2 / 0 | 3 / 0 |
+
+After 07 the process uses about 8 ms of CPU per frame in every project but Twirl (190 to 240 ms).
+The frames still dropped are the ones the test projects without effects drop too: decoding.
 
 Plan 06 removes the full-frame canvas and its resample, but the camera's working image is the
 full 1920×1080 frame (it is shown at 51.5 %, above the half size at which a reduced frame is

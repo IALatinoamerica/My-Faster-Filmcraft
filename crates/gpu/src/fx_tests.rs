@@ -591,6 +591,115 @@ fn gpu_shutter_transform_matches_cpu_exactly() {
     }
 }
 
+/// Luma Key, Rounded Crop, Drop Shadow, Noise and Ultra Key (`gpufx_more`): each alone, at a
+/// frame time whose noise seed needs 64 bits, and in chains where the multi-pass ones (the
+/// shadow under the picture, the key's matte beside it) follow and precede other effects.
+#[test]
+fn gpu_keys_crops_shadows_and_noise_match_cpu_exactly() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (96u32, 54u32);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let on = ParamValue::Bool(true);
+    let off = ParamValue::Bool(false);
+    let green = col(0.0, 1.0, 0.0);
+    // (effects, whether a threshold or a grain boundary may flip pixels)
+    let chains: Vec<(Vec<EffectInstance>, bool)> = vec![
+        (vec![effect("luma_key", &[])], true),
+        (vec![effect("luma_key", &[("threshold", fl(60.0)), ("cutoff", fl(20.0)), ("invert", on.clone())])], true),
+        (vec![effect("rounded_crop", &[])], false),
+        (
+            vec![effect(
+                "rounded_crop",
+                &[
+                    ("left", fl(10.0)),
+                    ("top", fl(5.0)),
+                    ("right", fl(20.0)),
+                    ("bottom", fl(15.0)),
+                    ("radius", fl(12.0)),
+                    ("feather", fl(4.0)),
+                    ("border", fl(3.0)),
+                ],
+            )],
+            false,
+        ),
+        (vec![effect("drop_shadow", &[])], false),
+        (vec![effect("drop_shadow", &[("distance", fl(9.5)), ("direction", fl(40.0)), ("softness", fl(12.0)), ("opacity", fl(80.0))])], false),
+        (vec![effect("drop_shadow", &[("distance", fl(4.0)), ("softness", fl(90.0)), ("only", on.clone()), ("color", col(0.2, 0.1, 0.6))])], false),
+        (vec![effect("noise", &[("amount", fl(35.0))])], false),
+        (vec![effect("noise", &[("amount", fl(80.0)), ("color", off.clone()), ("clip", off.clone()), ("grain_size", fl(3.0))])], true),
+        (vec![effect("noise", &[("amount", fl(50.0)), ("grain_size", fl(2.5))])], true),
+        (vec![effect("noise_legacy", &[("amount", fl(20.0))])], false),
+        (vec![effect("ultra_key", &[("key_color", green.clone())])], false),
+        (vec![effect("ultra_key", &[("key_color", green.clone()), ("setting", ch(2))])], false),
+        (
+            vec![effect("ultra_key", &[("key_color", green.clone()), ("setting", ch(3)), ("choke", fl(30.0)), ("soften", fl(25.0)), ("contrast", fl(40.0))])],
+            false,
+        ),
+        (
+            vec![effect(
+                "ultra_key",
+                &[
+                    ("key_color", green.clone()),
+                    ("setting", ch(3)),
+                    ("cc_saturation", fl(140.0)),
+                    ("cc_hue", fl(60.0)),
+                    ("cc_luminance", fl(90.0)),
+                    ("spill", fl(90.0)),
+                ],
+            )],
+            false,
+        ),
+        (vec![effect("ultra_key", &[("key_color", green.clone()), ("output", ch(1)), ("setting", ch(1))])], false),
+        (vec![effect("ultra_key", &[("key_color", col(0.1, 0.2, 0.9)), ("output", ch(2))])], false),
+        (
+            vec![
+                effect("ultra_key", &[("key_color", green.clone()), ("setting", ch(3)), ("choke", fl(10.0))]),
+                effect("rounded_crop", &[("radius", fl(20.0))]),
+                effect("drop_shadow", &[("distance", fl(6.0)), ("softness", fl(8.0))]),
+                effect("tint", &[("amount", fl(30.0))]),
+            ],
+            false,
+        ),
+        (
+            vec![
+                effect("gaussian_blur", &[("blurriness", fl(4.0))]),
+                effect("drop_shadow", &[("softness", fl(0.0))]),
+                effect("unsharp_mask", &[("amount", fl(120.0)), ("radius", fl(3.0))]),
+                effect("ultra_key", &[("key_color", green.clone())]),
+                effect("drop_shadow", &[("only", on.clone())]),
+            ],
+            false,
+        ),
+    ];
+    let mut failures = Vec::new();
+    // tick 4e14: 26 minutes into a timeline, beyond 32 bits
+    for t in [Tick::ZERO, Tick(400_000_000_123_457)] {
+        for (chain, steps) in &chains {
+            let names: Vec<&str> = chain.iter().map(|e| e.effect.as_str()).collect();
+            let ops: Vec<FxOp> = chain.iter().filter_map(|e| FxOp::eval(e, &cx(t, 1.0), w as usize, h as usize)).collect();
+            assert_eq!(ops.len(), chain.len(), "{names:?}");
+            assert!(ops.iter().all(FxOp::gpu_ok), "{names:?}");
+            let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+            for op in &ops {
+                op.apply(&mut cpu);
+            }
+            assert!(cpu.px != px, "{names:?}: the effect changes the picture");
+            let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, turns: 0, ops }).expect("effect image");
+            let (worst, flips) = compare(&cpu.px, &gpu);
+            eprintln!("{names:?} at {}: max rel diff {worst:.2e}, {:.3}% flipped", t.0, flips * 100.0);
+            if worst > EXACT * 2.0 || flips > if *steps { FLIPS } else { 0.0 } {
+                failures.push(format!("{names:?} at {}: {worst:.2e}, flips {flips:.4}", t.0));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "GPU effects differ from the CPU:\n{}", failures.join("\n"));
+}
+
 /// Keyframed parameters are evaluated at the layer's time on the CPU: the GPU result follows them.
 #[test]
 fn keyframed_effects_follow_time() {

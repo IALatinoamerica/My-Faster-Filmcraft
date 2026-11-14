@@ -57,6 +57,14 @@ const OP_BOKEH_UP: u32 = 35u;
 const OP_THREE_WAY: u32 = 36u;
 const OP_MASK: u32 = 100u;
 const OP_RESAMPLE_ACC: u32 = 101u;
+const OP_LUMA_KEY: u32 = 102u;
+const OP_ROUNDED_CROP: u32 = 103u;
+const OP_SHADOW: u32 = 104u;
+const OP_OVER_ORIG: u32 = 105u;
+const OP_NOISE: u32 = 106u;
+const OP_KEY_MATTE: u32 = 107u;
+const OP_KEY_CHOKE: u32 = 108u;
+const OP_KEY_FINAL: u32 = 109u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -674,6 +682,87 @@ fn lumetri_op(c: vec3<f32>, p: vec2<i32>) -> vec3<f32> {
 }
 
 // One output pixel of every op but the running-sum box blur.
+// ---- Noise: `effects::hash3` in 64-bit integers made of two u32 (low, high)
+
+// Full 64-bit product of two u32.
+fn mul32(a: u32, b: u32) -> vec2<u32> {
+    let a0 = a & 0xffffu; let a1 = a >> 16u; let b0 = b & 0xffffu; let b1 = b >> 16u;
+    let p00 = a0 * b0; let p01 = a0 * b1; let p10 = a1 * b0; let p11 = a1 * b1;
+    let mid = (p00 >> 16u) + (p01 & 0xffffu) + (p10 & 0xffffu);
+    return vec2((mid << 16u) | (p00 & 0xffffu), p11 + (p01 >> 16u) + (p10 >> 16u) + (mid >> 16u));
+}
+
+// Wrapping 64-bit multiply.
+fn mul64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let p = mul32(a.x, b.x);
+    return vec2(p.x, p.y + a.x * b.y + a.y * b.x);
+}
+
+// Wrapping 64-bit add.
+fn add64(a: vec2<u32>, b: vec2<u32>) -> vec2<u32> {
+    let lo = a.x + b.x;
+    return vec2(lo, a.y + b.y + select(0u, 1u, lo < a.x));
+}
+
+// 64-bit shift right by 0 < n < 32.
+fn shr64(a: vec2<u32>, n: u32) -> vec2<u32> {
+    return vec2((a.x >> n) | (a.y << (32u - n)), a.y >> n);
+}
+
+// `hash3(gx, gy, z)` with `zc` = z × 0x165667B19E3779F9.
+fn noise_hash(gx: u32, gy: u32, zc: vec2<u32>) -> f32 {
+    var h = mul64(vec2(gx, 0u), vec2(0x7F4A7C15u, 0x9E3779B9u)) ^ mul64(vec2(gy, 0u), vec2(0x27D4EB4Fu, 0xC2B2AE3Du)) ^ zc;
+    h = h ^ shr64(h, 31u);
+    h = mul64(h, vec2(0x1CE4E5B9u, 0xBF58476Du));
+    h = h ^ shr64(h, 29u);
+    return f32(h.y >> 8u) / 16777216.0;
+}
+
+// `(x as f32 / grain) as usize`: the grain cell of a pixel coordinate. The quotient is checked
+// against products, which are rounded exactly where a GPU's division may not be.
+fn grain_cell(x: i32, grain: f32) -> u32 {
+    if grain == 1.0 {
+        return u32(x);
+    }
+    let fx = f32(x);
+    var g = u32(fx / grain);
+    if f32(g + 1u) * grain <= fx {
+        g += 1u;
+    } else if g > 0u && f32(g) * grain > fx {
+        g -= 1u;
+    }
+    return g;
+}
+
+// ---- Ultra Key (`gpufx_more::UltraKey`): p0 = key Y'CbCr, |key chroma|²; p1 = tolerance, gain,
+// highlight, shadow; p2 = pedestal, choke amount, contrast, mid point; p3 = spill, desaturate,
+// range, spill luma; p4 = colour correction saturation, hue, luminance, on; i1 = dominant key
+// channel, output.
+
+// `filmcraft_color::rgb_to_ycbcr` with the BT.709 matrix.
+fn key_ycc(v: vec3<f32>) -> vec3<f32> {
+    let kr = 0.2126; let kb = 0.0722;
+    let y = kr * v.x + (1.0 - kr - kb) * v.y + kb * v.z;
+    return vec3(y, (v.z - y) / (2.0 * (1.0 - kb)), (v.x - y) / (2.0 * (1.0 - kr)));
+}
+
+// `UltraKey::matte` of a premultiplied pixel.
+fn key_matte(o: vec4<f32>) -> f32 {
+    if o.a <= 1e-6 {
+        return 0.0;
+    }
+    let y = key_ycc(enc(o.rgb / o.a));
+    let k = u.p0.xyz; let kmag2 = u.p0.w;
+    let proj = (y.y * k.y + y.z * k.z) / kmag2;
+    let dx = y.y - proj * k.y; let dy = y.z - proj * k.z;
+    let perp = sqrt(dx * dx + dy * dy) / sqrt(kmag2);
+    let keyness = clamp(proj, 0.0, 1.5) * (1.0 - smoothstep_fx(0.0, u.p1.x, perp));
+    var m = clamp(1.0 - keyness * u.p1.y, 0.0, 1.0);
+    m += max(y.x - k.x, 0.0) * u.p1.z * 2.0 * min(keyness, 1.0);
+    m += max(k.x - y.x, 0.0) * u.p1.w * 2.0 * min(keyness, 1.0);
+    return clamp((clamp(m, 0.0, 1.0) - u.p2.x) / (1.0 - u.p2.x), 0.0, 1.0);
+}
+
 fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
     let s = size();
     let pc = vec2<f32>(p) + 0.5;
@@ -692,6 +781,150 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             let blend = u.p0.x;
             return vec4(o.rgb * k, na * (1.0 - blend) + a * blend);
+        }
+        case OP_LUMA_KEY: {
+            // p0 = threshold, cutoff; i1.x = key out brights
+            let o = ld(p);
+            if o.a <= 0.0 {
+                return o;
+            }
+            var l = linear_to_srgb1(max(luma709(o.rgb / o.a), 0.0));
+            if u.i1.x != 0u {
+                l = 1.0 - l;
+            }
+            let th = u.p0.x; let cut = u.p0.y;
+            var a: f32;
+            if l <= cut {
+                a = 0.0;
+            } else if l >= max(th, cut + 1e-3) {
+                a = 1.0;
+            } else {
+                a = (l - cut) / max(th - cut, 1e-3);
+            }
+            return o * a;
+        }
+        case OP_ROUNDED_CROP: {
+            // p0 = x0 y0 x1 y1; p1 = radius, feather, border; p2 = border colour
+            let x0 = u.p0.x; let y0 = u.p0.y; let x1 = u.p0.z; let y1 = u.p0.w;
+            let rad = u.p1.x; let fe = u.p1.y; let border = u.p1.z;
+            let c = vec2((x0 + x1) / 2.0, (y0 + y1) / 2.0);
+            let hh = vec2((x1 - x0) / 2.0 - rad, (y1 - y0) / 2.0 - rad);
+            let q = abs(pc - c) - hh;
+            let d = length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - rad;
+            var o = ld(p);
+            if border > 0.0 {
+                let k = clamp(0.5 - d, 0.0, 1.0) - clamp(0.5 - d - border, 0.0, 1.0);
+                if k > 0.0 {
+                    o = vec4(u.p2.xyz * k, k) + o * (1.0 - k);
+                }
+            }
+            var a: f32;
+            if fe > 0.0 {
+                a = clamp(-d / fe, 0.0, 1.0);
+            } else {
+                a = clamp(0.5 - d, 0.0, 1.0);
+            }
+            return select(o, o * a, a < 1.0);
+        }
+        case OP_SHADOW: {
+            // Drop Shadow's shadow: the picture's alpha moved (the inverse map and rect of
+            // OP_RESAMPLE, p1.z = opacity) in the colour p2
+            if u.p1.w == 0.0 || u32(p.x) < u.i1.x || u32(p.x) >= u.i1.y || u32(p.y) < u.i1.z || u32(p.y) >= u.i1.w {
+                return vec4(0.0);
+            }
+            let m0 = u.p0; let m1 = u.p1;
+            let uu = m0.x * pc.x + m0.z * pc.y + m1.x;
+            let vv = m0.y * pc.x + m0.w * pc.y + m1.y;
+            if uu < -1.0 || vv < -1.0 || uu > f32(s.x) + 1.0 || vv > f32(s.y) + 1.0 {
+                return vec4(0.0);
+            }
+            let a = sample_bilinear(uu, vv).a * m1.z;
+            return vec4(u.p2.xyz * a, a);
+        }
+        case OP_OVER_ORIG: {
+            // the original (aux) over src, as `blend::composite` mixes Normal
+            let o = textureLoad(aux, p, 0);
+            let under = ld(p);
+            if o.a <= 0.0 {
+                return under;
+            }
+            return o + under * (1.0 - o.a);
+        }
+        case OP_NOISE: {
+            // p0 = amount, grain; i1 = seed product (low, high), colour noise, clip
+            let o = ld(p);
+            if o.a <= 0.0 {
+                return o;
+            }
+            let gx = grain_cell(p.x, u.p0.y);
+            let gy = grain_cell(p.y, u.p0.y);
+            let zc = vec2(u.i1.x, u.i1.y);
+            let n0 = noise_hash(gx, gy, zc) - 0.5;
+            var ns = vec3(n0);
+            if u.i1.z != 0u {
+                // the seeds of the other two channels: + 7777 and + 99991, times the multiplier
+                ns = vec3(n0, noise_hash(gx, gy, add64(zc, vec2(0x73506559u, 0x96E41AD7u))) - 0.5, noise_hash(gx, gy, add64(zc, vec2(0xD68A47DFu, 0xCEEFC0CCu))) - 0.5);
+            }
+            var c = enc(o.rgb / o.a) + ns * u.p0.x;
+            if u.i1.w != 0u {
+                c = clamp(c, vec3(0.0), vec3(1.0));
+            }
+            return vec4(dec(c) * o.a, o.a);
+        }
+        case OP_KEY_MATTE: {
+            return vec4(key_matte(ld(p)), 0.0, 0.0, 0.0);
+        }
+        case OP_KEY_CHOKE: {
+            // src: the blurred matte, aux: the picture
+            let a = key_matte(textureLoad(aux, p, 0));
+            let c = u.p2.y;
+            return vec4(min(a, clamp((ld(p).r - c) / (1.0 - c), 0.0, 1.0)), 0.0, 0.0, 0.0);
+        }
+        case OP_KEY_FINAL: {
+            // src: the matte, aux: the picture
+            let o = textureLoad(aux, p, 0);
+            var a = ld(p).r;
+            if u.p2.z > 0.0 {
+                let g = 1.0 + u.p2.z * 4.0;
+                a = clamp((a - u.p2.w) * g + u.p2.w, 0.0, 1.0);
+            }
+            var v = vec3(0.0);
+            if o.a > 1e-6 {
+                v = o.rgb / o.a;
+            }
+            v = enc(v);
+            let dom = u.i1.x;
+            let e = vec3(f32(dom == 0u), f32(dom == 1u), f32(dom == 2u));
+            let vd = dot(v, e);
+            let o1 = dot(v, e.zxy);
+            let o2 = dot(v, e.yzx);
+            let spill = u.p3.x; let desat = u.p3.y; let range = u.p3.z; let sluma = u.p3.w;
+            let limit = max(o1, o2) * (1.0 - range) + (o1 + o2) * 0.5 * range;
+            let excess = max(vd - limit, 0.0);
+            if excess > 0.0 && spill > 0.0 {
+                let l0 = luma709(v);
+                v = v - e * (excess * spill);
+                let l1 = luma709(v);
+                v = vec3(l1) + (v - vec3(l1)) * (1.0 - desat * min(excess * 4.0, 1.0));
+                v = v + vec3((l0 - l1) * sluma);
+            }
+            if u.p4.w != 0.0 {
+                var hsl = rgb_to_hsl(clamp(v, vec3(0.0), vec3(1.0)));
+                hsl.x = fract_euclid(hsl.x + u.p4.y);
+                hsl.y = clamp(hsl.y * u.p4.x, 0.0, 1.0);
+                hsl.z = clamp(hsl.z * u.p4.z, 0.0, 1.0);
+                v = hsl_to_rgb(hsl.x, hsl.y, hsl.z);
+            }
+            let l = dec(v);
+            if u.i1.y == 1u {
+                let g = srgb_to_linear1(a);
+                return vec4(vec3(g * o.a), o.a);
+            }
+            if u.i1.y == 2u {
+                return vec4(l * o.a, o.a);
+            }
+            let na = a * o.a;
+            return vec4(l * na, na);
         }
         case OP_MASK: {
             // opacity masks: `mask::scale_by` with the coverage plane in `aux`

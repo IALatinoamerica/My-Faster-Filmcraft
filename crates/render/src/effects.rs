@@ -124,6 +124,12 @@ pub fn apply(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
         op.apply(img);
         return;
     }
+    apply_own(img, e, cx);
+}
+
+/// The effects rendered by this module's own code (the reference of the ops `gpufx_more` renders
+/// some of them with).
+pub(crate) fn apply_own(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
     match e.effect.as_str() {
         "lumetri" => lumetri(img, e, cx),
         "median" => {

@@ -59,6 +59,16 @@ const OP_BOKEH_UP: u32 = 35;
 const OP_THREE_WAY: u32 = 36;
 const OP_MASK: u32 = 100;
 const OP_RESAMPLE_ACC: u32 = 101;
+const OP_LUMA_KEY: u32 = 102;
+const OP_ROUNDED_CROP: u32 = 103;
+const OP_SHADOW: u32 = 104;
+const OP_OVER_ORIG: u32 = 105;
+const OP_NOISE: u32 = 106;
+const OP_KEY_MATTE: u32 = 107;
+const OP_KEY_CHOKE: u32 = 108;
+const OP_KEY_FINAL: u32 = 109;
+/// `effects::hash3`'s multiplier of the seed (the shader gets the product).
+const NOISE_SEED_MUL: u64 = 0x1656_67B1_9E37_79F9;
 
 /// Coverage planes of opacity masks kept as textures (a static mask is one plane for every frame).
 const MASK_PLANES: usize = 8;
@@ -347,6 +357,90 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
                 s.reads_orig = true;
                 s.combine = i + 1 == samples.len();
                 out.push(s);
+            }
+        }
+        FxOp::LumaKey(k) => out.push(step(OP_LUMA_KEY, [k.invert as u32, 0, 0, 0], &[k.th, k.cut])),
+        FxOp::RoundedCrop(c) => {
+            out.push(step(OP_ROUNDED_CROP, [0; 4], &[c.x0, c.y0, c.x1, c.y1, c.rad, c.feather, c.border, 0.0, c.bc[0], c.bc[1], c.bc[2]]));
+        }
+        FxOp::DropShadow(d) => {
+            // the shadow from the picture's alpha, its blur, then the untouched picture over it
+            let c = d.color;
+            let mut shadow = match &d.shift.inv {
+                Some(m) => {
+                    step(OP_SHADOW, d.shift.rect, &[m.a as f32, m.b as f32, m.c as f32, m.d as f32, m.e as f32, m.f as f32, d.opacity, 1.0, c[0], c[1], c[2]])
+                }
+                None => step(OP_SHADOW, [0; 4], &[0.0; 8]),
+            };
+            shadow.reads_orig = !d.only;
+            out.push(shadow);
+            let first = out.len();
+            boxes(&d.rx, false, false, &mut out);
+            boxes(&d.ry, true, false, &mut out);
+            if !d.only {
+                for s in out.iter_mut().skip(first) {
+                    s.unsharp_blur = true;
+                }
+                let mut over = step(OP_OVER_ORIG, [0; 4], &[]);
+                over.combine = true;
+                out.push(over);
+            }
+        }
+        FxOp::Noise(n) => {
+            if n.is_active() {
+                let zc = n.seed.wrapping_mul(NOISE_SEED_MUL);
+                out.push(step(OP_NOISE, [zc as u32, (zc >> 32) as u32, n.colored as u32, n.clip as u32], &[n.amount, n.grain]));
+            }
+        }
+        FxOp::UltraKey(k) => {
+            // The matte is a function of the picture alone, so the picture stays untouched in one
+            // texture while the matte is made, blurred and cleaned up in the others.
+            let cc = k.cc.unwrap_or([1.0, 0.0, 1.0]);
+            let p = [
+                k.key[0],
+                k.key[1],
+                k.key[2],
+                k.kmag2,
+                k.tol,
+                k.gain,
+                k.highlight,
+                k.shadow,
+                k.pedestal,
+                k.choke.as_ref().map_or(0.0, |c| c.2),
+                k.contrast,
+                k.mid,
+                k.spill,
+                k.desat,
+                k.range,
+                k.spill_luma,
+                cc[0],
+                cc[1],
+                cc[2],
+                if k.cc.is_some() { 1.0 } else { 0.0 },
+            ];
+            let i1 = [k.dom.min(2), k.output, 0, 0];
+            let pass = |code: u32, out: &mut Vec<Step>| {
+                let mut s = step(code, i1, &p);
+                s.reads_orig = true;
+                out.push(s);
+            };
+            let blur = |rx: &[u32], ry: &[u32], out: &mut Vec<Step>| {
+                let first = out.len();
+                boxes(rx, false, false, out);
+                boxes(ry, true, false, out);
+                for s in out.iter_mut().skip(first) {
+                    s.unsharp_blur = true;
+                }
+            };
+            pass(OP_KEY_MATTE, &mut out);
+            if let Some((rx, ry, _)) = &k.choke {
+                blur(rx, ry, &mut out);
+                pass(OP_KEY_CHOKE, &mut out);
+            }
+            blur(&k.soften.0, &k.soften.1, &mut out);
+            pass(OP_KEY_FINAL, &mut out);
+            if let Some(last) = out.last_mut() {
+                last.combine = true;
             }
         }
         FxOp::Mask { cov } => {

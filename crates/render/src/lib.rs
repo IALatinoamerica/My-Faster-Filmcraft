@@ -17,6 +17,7 @@ pub mod colorman;
 pub mod effects;
 pub mod flow;
 pub mod gpufx;
+pub mod gpufx_more;
 pub mod graphic_clip;
 pub mod graphics;
 pub mod image;
