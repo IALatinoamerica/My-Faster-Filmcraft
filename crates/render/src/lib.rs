@@ -549,6 +549,44 @@ pub(crate) fn item_layer_ex(
     sources: &dyn SourceProvider,
     want: LayerWant<'_>,
 ) -> Option<Layer> {
+    let (w, h) = output_size(seq, opts.scale);
+    Some(item_layer_unplaced(project, seq, item, t, opts, sources, want)?.placed(w, h))
+}
+
+/// What [`item_layer_unplaced`] makes of a clip.
+pub(crate) enum Unplaced {
+    /// A layer already in output pixels.
+    Layer(Layer),
+    /// The clip's working image after its effects and opacity masks, and the map from its pixels
+    /// to output pixels: placing it is all that is left. The GPU plan hands such an image to the
+    /// compositor with the map, so a clip with an effect only the CPU runs costs an image of its
+    /// own size, not a canvas of the output's.
+    Working { image: Image, matrix: Affine, opacity: f32, blend: Blend },
+}
+
+impl Unplaced {
+    /// The layer in output pixels (`w`×`h`).
+    pub(crate) fn placed(self, w: usize, h: usize) -> Layer {
+        match self {
+            Unplaced::Layer(l) => l,
+            Unplaced::Working { image, matrix, opacity, blend } => {
+                let placed = if image.w == w && image.h == h && identity_placement(&matrix) { image } else { image.transformed(w, h, &matrix) };
+                Layer::Full { image: placed, opacity, blend, opaque: false }
+            }
+        }
+    }
+}
+
+/// [`item_layer_ex`] up to the placement of the clip's working image.
+pub(crate) fn item_layer_unplaced(
+    project: &Project,
+    seq: &Sequence,
+    item: &TrackItem,
+    t: Tick,
+    opts: RenderOptions,
+    sources: &dyn SourceProvider,
+    want: LayerWant<'_>,
+) -> Option<Unplaced> {
     let LayerWant { tc, allow_region } = want;
     let (w, h) = output_size(seq, opts.scale);
     // `mt`: where effects and Motion/Opacity are evaluated (differs from the shown frame's media
@@ -566,7 +604,7 @@ pub(crate) fn item_layer_ex(
         let mut canvas = Image::new(w, h);
         graphic_clip::render_graphic(item, mt, src_size, &m, &mut canvas);
         let (op, bl) = opacity_blend(item, mt);
-        return Some(Layer::Full { image: canvas, opacity: op, blend: bl, opaque: false });
+        return Some(Unplaced::Layer(Layer::Full { image: canvas, opacity: op, blend: bl, opaque: false }));
     }
     // plain media: nothing but the frame itself reaches the output
     let plain_media = matches!(pi.kind, ItemKind::Media(_) | ItemKind::Subclip { .. })
@@ -583,7 +621,7 @@ pub(crate) fn item_layer_ex(
             let cs = colorman::source_space(project, item.item, &frame);
             if !colorman::needs_management(&seq.settings.color, cs, &frame) {
                 let (op, bl) = opacity_blend(item, mt);
-                return Some(plain_layer(&frame, n, op, bl));
+                return Some(Unplaced::Layer(plain_layer(&frame, n, op, bl)));
             }
         }
         // anything else takes the general path below, with the frame already fetched
@@ -617,9 +655,8 @@ pub(crate) fn item_layer_ex(
         }
     }
     mask::apply_opacity_masks(&mut layer, item, mt, px_scale);
-    let placed = if layer.w == w && layer.h == h && identity_placement(&m) { layer } else { layer.transformed(w, h, &m) };
     let (op, bl) = opacity_blend(item, mt);
-    Some(Layer::Full { image: placed, opacity: op, blend: bl, opaque: false })
+    Some(Unplaced::Working { image: layer, matrix: m, opacity: op, blend: bl })
 }
 
 /// The layer of a plain media frame (see [`item_layer_ex`]): only the part with alpha when the frame

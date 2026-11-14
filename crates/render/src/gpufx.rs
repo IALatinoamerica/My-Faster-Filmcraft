@@ -322,7 +322,7 @@ fn resample(w: usize, h: usize, m: &Affine, opacity: f32) -> Resample {
 }
 
 /// Whether `Image::transformed` would take its mip (downsample) path for `m` on a `w`×`h` image.
-fn minifies(m: &Affine, w: usize, h: usize) -> bool {
+pub(crate) fn minifies(m: &Affine, w: usize, h: usize) -> bool {
     let sx = (m.a * m.a + m.b * m.b).sqrt();
     let sy = (m.c * m.c + m.d * m.d).sqrt();
     let minify = 1.0 / sx.min(sy).max(1e-6);

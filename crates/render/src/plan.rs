@@ -680,8 +680,20 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
     }
     // CPU-rendered layer (standard effects): drawn by the GPU as a pre-rendered canvas image.
     let tc = filmcraft_time::format_time(t, seq.settings.frame_rate, seq.settings.drop_frame, filmcraft_time::TimeDisplay::Timecode, 48_000);
-    if let Some((img, op2, _)) = crate::item_layer(project, seq, item, t, opts, sources, &tc) {
-        out.push(PlanLayer::new(cpu_frame(img), Affine::IDENTITY, op2 * extra_opacity, bl));
+    let (w, h) = output_size(seq, opts.scale);
+    let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
+    match crate::item_layer_unplaced(project, seq, item, t, opts, sources, crate::LayerWant { tc: &tc, allow_region: false }) {
+        // A media clip's effects ran on the CPU; the GPU places their picture as it places a
+        // frame. Where the CPU would take its mip path (a reduction by half or more) it places the
+        // picture too, and so it does for nested sequences and graphics.
+        Some(crate::Unplaced::Working { image, matrix, opacity, .. }) if is_media && !crate::gpufx::minifies(&matrix, image.w, image.h) => {
+            out.push(PlanLayer::new(cpu_frame(image), matrix, opacity * extra_opacity, bl));
+        }
+        Some(layer) => {
+            let (img, op2, _) = layer.placed(w, h).into_full(w, h);
+            out.push(PlanLayer::new(cpu_frame(img), Affine::IDENTITY, op2 * extra_opacity, bl));
+        }
+        None => {}
     }
 }
 

@@ -22,3 +22,26 @@ Notes from the baseline:
   wall time per picture inside the decoder (read-back included), against about 4 ms per picture
   for the software decoder on the same clips. Two 60 fps sources need 120 pictures a second.
 - A seek decodes about 66 pictures per source; decoding is 500 of the 606 ms.
+
+## Effect test projects
+
+`FX <effect> CAM.fcproj` has the effect on every camera clip, `FX <effect> ADJ.fcproj` on a
+full-frame adjustment layer over the whole sequence (copies of `SHORT TEST.fcproj`). 10 s from
+5 s at Full; frames shown of 600.
+
+| Project | After 02 | After 06 |
+|---|---|---|
+| Luma Key CAM | 0 | 145 |
+| Rounded Crop CAM | 4 | 247 |
+| Noise CAM | 1 | 23 |
+| Twirl CAM | 1 | 2 |
+| Ultra Key CAM | 0 | 2 |
+| Ultra Key Soft CAM | 0 | 0 |
+| Drop Shadow CAM | 0 | 0 |
+| every ADJ project | 0 | 0 |
+
+Plan 06 removes the full-frame canvas and its resample, but the camera's working image is the
+full 1920×1080 frame (it is shown at 51.5 %, above the half size at which a reduced frame is
+decoded), so a CPU effect on it still costs a full-frame float image and its upload per frame.
+It is restricted to media clips: a transformed nested sequence placed by the GPU did not match
+the CPU picture (`export_renderer::tests::transformed_nested_picture_matches_cpu`).

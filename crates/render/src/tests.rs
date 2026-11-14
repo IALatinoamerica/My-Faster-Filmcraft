@@ -685,3 +685,37 @@ fn hostile_opacity_masks_plan_without_panicking() {
         assert_eq!((got.w, got.h), (320, 180));
     }
 }
+
+/// A clip with an effect only the CPU runs is planned as its working image with the placement
+/// left to the GPU, not as a canvas the size of the output (a small clip's working image is
+/// decoded small, so it is placed that way at any Motion scale). The plan's CPU execution is the
+/// reference renderer's picture.
+#[test]
+fn a_cpu_effect_clip_is_planned_as_its_working_image() {
+    let build = |scale: f64| {
+        let (mut p, red, ocean, seq, map) = setup();
+        place(&mut p, seq, 0, red, 0, 48);
+        let top = place(&mut p, seq, 1, ocean, 0, 48);
+        let s = p.sequence_mut(seq).unwrap();
+        let (_, it) = s.find_item_mut(top).unwrap();
+        let m = it.effect_mut("motion").unwrap();
+        m.params.get_mut("scale").unwrap().value = ParamValue::Float(scale);
+        m.params.get_mut("position").unwrap().value = ParamValue::Vec2(filmcraft_geom::Vec2::new(200.0, 110.0));
+        it.effects.insert(0, filmcraft_project::find_effect("twirl").unwrap().instance());
+        (p, seq, map)
+    };
+    let r = FrameRate::FPS_24;
+    for scale in [75.0, 140.0, 30.0] {
+        let (p, seq, map) = build(scale);
+        let opts = RenderOptions::default();
+        let reference = render_sequence(&p, seq, r.tick_of(5), opts, &map);
+        let plan = plan::plan_frame(&p, seq, r.tick_of(5), opts, plan::DeviceCaps::ALL, &map);
+        let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("layers") };
+        let top = layers.last().expect("the clip's layer");
+        assert!(top.fx.is_none() && matches!(top.frame.data, filmcraft_frame::PixelData::RgbaF32(_)), "the effect ran on the CPU");
+        assert!(top.matrix != Affine::IDENTITY, "Motion at {scale} %: placed by the GPU");
+        let got = plan::execute_cpu(&plan);
+        let max = got.px.iter().zip(&reference.px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max < 0.02, "Motion at {scale} %: max diff {max}");
+    }
+}
