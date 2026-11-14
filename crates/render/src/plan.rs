@@ -334,6 +334,63 @@ pub fn plan_frame(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOption
     layers.finish(w, h)
 }
 
+/// The frames of the media clips showing at `t` on the tracks of `seq_id`, as the plan and the
+/// CPU renderer ask their sources for them (clips inside nested sequences are left out).
+fn media_requests(
+    project: &Project,
+    seq_id: ItemId,
+    t: Tick,
+    opts: RenderOptions,
+    sources: &dyn SourceProvider,
+) -> Vec<(filmcraft_media::SharedSource, FrameRequest)> {
+    let Some(seq) = project.sequence(seq_id) else { return Vec::new() };
+    let mut out = Vec::new();
+    for tr in seq.video_tracks.iter().filter(|tr| tr.enabled) {
+        let showing: Vec<&TrackItem> = match tr.transitions.iter().find(|x| x.range().contains(t)) {
+            Some(trn) => [trn.from, trn.to].into_iter().flatten().filter_map(|id| tr.item(id)).collect(),
+            None => tr.item_at(t).into_iter().collect(),
+        };
+        for item in showing.into_iter().filter(|i| i.enabled) {
+            let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
+            let (Some(size), true) = (crate::source_size(project, item.item), is_media) else { continue };
+            let Some(src) = sources.source(item.item) else { continue };
+            let motion = motion_matrix(seq, item, size, crate::source_par(project, item.item), item.effect_time_at(t));
+            let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
+            let scale = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
+            let time = crate::video_source_time(item, t, src.info().frame_rate());
+            out.push((src, FrameRequest { time, scale }));
+        }
+    }
+    out
+}
+
+/// Fetch the frames of the media clips showing at `t` at the same time, each on a thread of its
+/// own, before the frame is planned or rendered: every source decodes on its own, and after a
+/// seek each decodes from its keyframe, so a frame of two clips waits for the slower of the two
+/// instead of for both in turn. The frames stay in the sources' caches for the plan to take.
+/// With fewer than two clips, or when no thread can be started, this does nothing.
+pub fn prefetch_sources(project: &Project, seq_id: ItemId, t: Tick, opts: RenderOptions, sources: &dyn SourceProvider) {
+    let requests = media_requests(project, seq_id, t, opts, sources);
+    if requests.len() < 2 {
+        return;
+    }
+    let ctx = filmcraft_media::cancel::Context::current();
+    std::thread::scope(|scope| {
+        for (src, req) in requests {
+            let ctx = ctx.clone();
+            // plain threads, not the rayon pool: see `filmcraft_codecs::gop` on waiting for a
+            // source's decoding from a pool thread. A fetch that fails here fails again, and is
+            // reported, when the plan asks for the frame.
+            let spawned = std::thread::Builder::new().name("filmcraft-prefetch".into()).spawn_scoped(scope, move || {
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ctx.run(|| src.video_frame_unturned(req).is_ok())));
+            });
+            if spawned.is_err() {
+                break;
+            }
+        }
+    });
+}
+
 /// Whether [`plan_frame`] hands the frame at `t` back as one CPU image ([`FramePlan::Image`]) for
 /// a device that runs `caps`. A GPU renderer gains nothing on such a frame, so a caller with only a
 /// few of them (the export's pool) can render it on the CPU without taking one.

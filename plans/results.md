@@ -15,6 +15,7 @@
 | Baseline | 1 | 543 | 0 | 1 | 159.3 | 606 / 907 |
 | 01 masks on the GPU | 551 | 551 | 0 | 535 | 8.7 | 607 / 925 |
 | 02 shutter Transform on the GPU | 554 | 543 | 598 | 537 | 8.4 | 524 / 841 |
+| 03a sources fetched side by side | 549 | 555 | 598 | 530 | 9.3 | 372 / 556 |
 
 Notes from the baseline:
 

@@ -1101,6 +1101,8 @@ fn plan_job(
         return (filmcraft_render::plan::FramePlan::Layers { width: w, height: h, layers }, true);
     }
     let provider = provider(job, pool, services);
+    // the sources of the frame's clips decode side by side (their time is source time)
+    timed_source(|| filmcraft_render::plan::prefetch_sources(&job.project, seq, job.time, opts, &provider));
     (filmcraft_render::plan::plan_frame(&job.project, seq, job.time, opts, caps, &provider), false)
 }
 

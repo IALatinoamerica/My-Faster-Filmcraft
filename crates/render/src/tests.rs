@@ -719,3 +719,64 @@ fn a_cpu_effect_clip_is_planned_as_its_working_image() {
         assert!(max < 0.02, "Motion at {scale} %: max diff {max}");
     }
 }
+
+/// A source that counts its fetches, how many ran at once, and whether one saw a cancel flag.
+struct SlowSource {
+    inner: GeneratorSource,
+    in_flight: Arc<std::sync::atomic::AtomicUsize>,
+    most: Arc<std::sync::atomic::AtomicUsize>,
+    calls: Arc<std::sync::atomic::AtomicUsize>,
+    cancelled: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl MediaSource for SlowSource {
+    fn info(&self) -> &filmcraft_media::MediaInfo {
+        self.inner.info()
+    }
+    fn video_frame(&self, req: FrameRequest) -> filmcraft_media::Result<Arc<filmcraft_frame::VideoFrame>> {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.calls.fetch_add(1, SeqCst);
+        self.cancelled.fetch_add(filmcraft_media::cancel::cancelled() as usize, SeqCst);
+        let now = self.in_flight.fetch_add(1, SeqCst) + 1;
+        self.most.fetch_max(now, SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        self.in_flight.fetch_sub(1, SeqCst);
+        self.inner.video_frame(req)
+    }
+    fn audio(&self, start: i64, frames: usize, sample_rate: u32) -> filmcraft_media::Result<filmcraft_frame::AudioBuffer> {
+        self.inner.audio(start, frames, sample_rate)
+    }
+}
+
+/// The frames of the clips showing at a time are fetched side by side before the frame is
+/// planned, carrying the job's cancel flag; a frame of one clip starts no thread.
+#[test]
+fn the_sources_of_a_frame_are_fetched_at_the_same_time() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+    let (mut p, red, ocean, seq, mut map) = setup();
+    let counters = [(); 4].map(|_| Arc::new(AtomicUsize::new(0)));
+    let [in_flight, most, calls, cancelled] = counters.clone();
+    for (id, g) in [
+        (red, GeneratorSource::new(Generator::ColorMatte { color: [1.0, 0.0, 0.0, 1.0] }, 320, 180, FrameRate::FPS_24, Tick(10 * TICKS_PER_SECOND))),
+        (ocean, GeneratorSource::demo(DemoScene::OceanSunset)),
+    ] {
+        let s = SlowSource { inner: g, in_flight: in_flight.clone(), most: most.clone(), calls: calls.clone(), cancelled: cancelled.clone() };
+        map.0.insert(id, Arc::new(s) as SharedSource);
+    }
+    place(&mut p, seq, 0, ocean, 0, 48);
+    let opts = RenderOptions::default();
+    let t = FrameRate::FPS_24.tick_of(5);
+    plan::prefetch_sources(&p, seq, t, opts, &map);
+    assert_eq!(calls.load(SeqCst), 0, "one clip: nothing to fetch side by side");
+    place(&mut p, seq, 1, red, 0, 48);
+    plan::prefetch_sources(&p, seq, t, opts, &map);
+    assert_eq!((calls.load(SeqCst), most.load(SeqCst)), (2, 2), "two clips: both fetched, at the same time");
+    assert_eq!(cancelled.load(SeqCst), 0);
+    let flag = Arc::new(AtomicBool::new(true));
+    filmcraft_media::cancel::with_cancel(&flag, || plan::prefetch_sources(&p, seq, t, opts, &map));
+    assert_eq!(cancelled.load(SeqCst), 2, "the fetches see the job's cancel flag");
+    // a time with no clip, and a sequence that does not exist
+    plan::prefetch_sources(&p, seq, FrameRate::FPS_24.tick_of(500), opts, &map);
+    plan::prefetch_sources(&p, ItemId(u64::MAX), t, opts, &map);
+    assert_eq!(calls.load(SeqCst), 4);
+}
