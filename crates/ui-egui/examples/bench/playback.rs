@@ -612,6 +612,14 @@ struct Args {
     workers: usize,
     json: Option<String>,
     repeat: usize,
+    /// `--project`: a project file for the `project` / `project-seek` scenarios.
+    project: Option<String>,
+    /// `--sequence`: the sequence of `--project` to play, by name (default: the active one).
+    sequence: Option<String>,
+    /// `--start`: where the `project` scenario starts playing (s).
+    start: f64,
+    /// `--hw auto`: register the OS hardware decoders, as the desktop app does.
+    hw: bool,
 }
 
 fn parse_args() -> Args {
@@ -624,6 +632,10 @@ fn parse_args() -> Args {
         workers: FrameServer::default_workers(),
         json: None,
         repeat: 1,
+        project: None,
+        sequence: None,
+        start: 0.0,
+        hw: false,
     };
     let mut it = std::env::args().skip(1);
     while let Some(x) = it.next() {
@@ -648,6 +660,10 @@ fn parse_args() -> Args {
             "--workers" => a.workers = it.next().and_then(|v| v.parse().ok()).unwrap_or(a.workers),
             "--repeat" => a.repeat = it.next().and_then(|v| v.parse().ok()).unwrap_or(1),
             "--json" => a.json = it.next(),
+            "--project" => a.project = it.next(),
+            "--sequence" => a.sequence = it.next(),
+            "--start" => a.start = it.next().and_then(|v| v.parse().ok()).unwrap_or(0.0),
+            "--hw" => a.hw = it.next().as_deref() == Some("auto"),
             "--help" | "-h" => {
                 println!(
                     "bench_playback [--scenario h264-1080,stack3,stack3-blend,stack3-fx,h264-2160,hevc-2160,vp9-2160,av1-2160,demo,after-preview,seek-storm] [--res full,half] [--cpu|--gpu] [--seconds 8] [--refresh 60] [--workers N] [--repeat N] [--json out.json]"
@@ -767,9 +783,35 @@ pub fn scenario_session(name: &str) -> Option<(Session, ItemId)> {
     Some((s, seq))
 }
 
+/// The session of the `project` / `project-seek` scenarios: the project file `path` with its
+/// sequence named `sequence` (default: the active one). None when it cannot be opened.
+fn project_session(path: Option<&str>, sequence: Option<&str>) -> Option<(Session, ItemId)> {
+    let Some(path) = path else {
+        eprintln!("the project scenarios need --project <file>");
+        return None;
+    };
+    let mut s = Session::default();
+    if let Err(e) = s.execute("file.open", json!({ "path": path })) {
+        eprintln!("{path}: {e}");
+        return None;
+    }
+    let seq = match sequence {
+        Some(name) => s.project.items.values().find(|i| i.name == name && matches!(i.kind, filmcraft_project::ItemKind::Sequence(_))).map(|i| i.id),
+        None => s.state.active_sequence,
+    };
+    if seq.is_none() {
+        eprintln!("{path}: no such sequence");
+    }
+    Some((s, seq?))
+}
+
 /// `bench_playback` / `cargo xtask bench-playback`.
 pub fn cli_main() {
     let args = parse_args();
+    if args.hw {
+        filmcraft_platform::register();
+        filmcraft_codecs::hw::set_hardware_decoding(true);
+    }
     let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     println!(
         "FilmCraft playback bench: {} path, {} frame workers, {} cores, refresh {} Hz, {} s per play; load avg {}",
@@ -790,7 +832,8 @@ pub fn cli_main() {
             if name == "seek-storm" && res_name != "full" && args.res.len() > 1 {
                 continue;
             }
-            let Some((mut s, seq)) = scenario_session(name) else {
+            let session = if name.starts_with("project") { project_session(args.project.as_deref(), args.sequence.as_deref()) } else { scenario_session(name) };
+            let Some((mut s, seq)) = session else {
                 println!("{name}: skipped (fixtures unavailable: is ffmpeg installed?)");
                 continue;
             };
@@ -828,7 +871,21 @@ pub fn cli_main() {
                         }
                         s.previews.delete(None);
                     }
-                    _ => reports.push(bench.play(&s, seq, &mut display, *scale, Tick::ZERO, &tag("play"))),
+                    "project-seek" => {
+                        // every jump waits for its frame (up to 1 s): `lat` is the time to the exact frame
+                        let mut r = bench.seek_storm(&s, seq, &mut display, *scale, 40, Duration::from_millis(1000));
+                        r.label = tag("seek");
+                        reports.push(r);
+                    }
+                    _ => reports.push(bench.play(&s, seq, &mut display, *scale, Tick::from_seconds_f64(args.start), &tag("play"))),
+                }
+                if name.starts_with("project") {
+                    let hw = filmcraft_codecs::hw::hw_stats();
+                    let fs = bench.server.stats().to_json();
+                    eprintln!(
+                        "  hardware decoding: {} pictures, {} sessions, {} declined, {} fallbacks; job decodeMs {} renderMs {}",
+                        hw.frames, hw.sessions, hw.declined, hw.fallbacks, fs["decodeMs"], fs["renderMs"]
+                    );
                 }
                 for r in &reports {
                     print_row(r, fps);
