@@ -55,6 +55,7 @@ const OP_BOKEH_BOOST: u32 = 33u;
 const OP_BOKEH: u32 = 34u;
 const OP_BOKEH_UP: u32 = 35u;
 const OP_THREE_WAY: u32 = 36u;
+const OP_MASK: u32 = 100u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -664,6 +665,10 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             let blend = u.p0.x;
             return vec4(o.rgb * k, na * (1.0 - blend) + a * blend);
+        }
+        case OP_MASK: {
+            // opacity masks: `mask::scale_by` with the coverage plane in `aux`
+            return ld(p) * textureLoad(aux, p, 0).r;
         }
         case OP_ALPHA_ADJUST: {
             let o = ld(p);

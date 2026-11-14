@@ -613,3 +613,75 @@ fn in_between_frames_stay_inside_the_source_range() {
         }
     }
 }
+
+/// A media clip with an opacity mask plans as a GPU layer: the frame as decoded with the masks'
+/// coverage as the last op of its effect stage, not a CPU-rendered canvas. The plan's CPU
+/// execution is the reference renderer's picture.
+#[test]
+fn a_masked_media_clip_plans_for_the_gpu() {
+    use filmcraft_project::{Mask, MaskPath};
+    let (mut p, red, ocean, seq, map) = setup();
+    place(&mut p, seq, 0, ocean, 0, 48);
+    let top = place(&mut p, seq, 1, red, 0, 48);
+    {
+        let s = p.sequence_mut(seq).unwrap();
+        let (_, it) = s.find_item_mut(top).unwrap();
+        let m = it.effect_mut("motion").unwrap();
+        m.params.get_mut("scale").unwrap().value = ParamValue::Float(60.0);
+        m.params.get_mut("position").unwrap().value = ParamValue::Vec2(filmcraft_geom::Vec2::new(200.0, 100.0));
+        let mut mask = Mask::new("circle", MaskPath::ellipse(filmcraft_geom::Vec2::new(160.0, 90.0), filmcraft_geom::Vec2::new(70.0, 70.0)));
+        mask.feather.value = ParamValue::Float(6.0);
+        it.effect_mut("opacity").unwrap().masks.push(mask);
+        assert!(it.has_opacity_masks());
+    }
+    let r = FrameRate::FPS_24;
+    let mut planes = Vec::new();
+    for (f, scale) in [(0, 1.0), (12, 1.0), (12, 0.5)] {
+        let opts = RenderOptions { scale, ..Default::default() };
+        let reference = render_sequence(&p, seq, r.tick_of(f), opts, &map);
+        let plan = plan::plan_frame(&p, seq, r.tick_of(f), opts, plan::DeviceCaps::ALL, &map);
+        let plan::FramePlan::Layers { layers, .. } = &plan else { panic!("a masked clip should be GPU-drawable") };
+        let masked = layers.last().expect("the masked layer");
+        let fx = masked.fx.as_ref().expect("the masked layer has an effect stage");
+        let Some(gpufx::FxOp::Mask { cov }) = fx.ops.last() else { panic!("the masks are the last op: {:?}", fx.ops.len()) };
+        assert_eq!(cov.len(), fx.size.0 as usize * fx.size.1 as usize);
+        assert!(cov.contains(&0.0) && cov.contains(&1.0), "inside and outside the circle");
+        if scale == 1.0 {
+            planes.push(cov.clone());
+        }
+        let got = plan::execute_cpu(&plan);
+        assert_eq!((got.w, got.h), (reference.w, reference.h));
+        let max = got.px.iter().zip(&reference.px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max < 0.02, "frame {f} at {scale}: max diff {max}");
+    }
+    // a mask without keyframes is one plane for every frame (the compositor uploads it once)
+    assert!(Arc::ptr_eq(&planes[0], &planes[1]));
+}
+
+/// Hostile masks never panic the plan: no vertices, non-finite vertices, a huge feather.
+#[test]
+fn hostile_opacity_masks_plan_without_panicking() {
+    use filmcraft_geom::Vec2;
+    use filmcraft_project::{Mask, MaskPath};
+    let paths = [
+        MaskPath::rect(0.0, 0.0, 0.0, 0.0),
+        MaskPath::ellipse(Vec2::new(f64::NAN, f64::INFINITY), Vec2::new(-1.0, f64::NAN)),
+        MaskPath::ellipse(Vec2::new(1e30, -1e30), Vec2::new(1e30, 1e30)),
+    ];
+    for path in paths {
+        let (mut p, red, _, seq, map) = setup();
+        let top = place(&mut p, seq, 0, red, 0, 48);
+        {
+            let s = p.sequence_mut(seq).unwrap();
+            let (_, it) = s.find_item_mut(top).unwrap();
+            let mut mask = Mask::new("m", path);
+            mask.feather.value = ParamValue::Float(1e30);
+            mask.expansion.value = ParamValue::Float(f64::NAN);
+            it.effect_mut("opacity").unwrap().masks.push(mask);
+        }
+        let opts = RenderOptions::default();
+        let plan = plan::plan_frame(&p, seq, Tick::ZERO, opts, plan::DeviceCaps::ALL, &map);
+        let got = plan::execute_cpu(&plan);
+        assert_eq!((got.w, got.h), (320, 180));
+    }
+}

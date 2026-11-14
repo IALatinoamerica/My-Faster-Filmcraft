@@ -248,12 +248,13 @@ fn simple_transition(id: &str) -> bool {
     matches!(id, "cross_dissolve" | "dip_to_black" | "dip_to_white")
 }
 
-/// The standard effects of a media clip if the GPU can draw it (any blend mode, no opacity masks,
-/// every enabled standard effect unmasked and with a GPU implementation; empty without effects or
-/// with effects off). None: the clip is rendered on the CPU.
+/// The standard effects of a media clip if the GPU can draw it (any blend mode, every enabled
+/// standard effect unmasked and with a GPU implementation; empty without effects or with effects
+/// off). None: the clip is rendered on the CPU. Opacity masks are the last op of the effect stage
+/// ([`opacity_mask_op`]).
 fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
     let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
-    if !is_media || item.has_opacity_masks() {
+    if !is_media {
         return None;
     }
     if !opts.effects {
@@ -271,6 +272,38 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
         chain.push(e);
     }
     Some(chain)
+}
+
+/// Coverage planes of opacity masks made so far, most recently used last: (the masks flattened
+/// for the working image, its size, the plane). A mask without keyframes is rasterised once for
+/// all the frames of its clip, and the compositor finds the uploaded plane by its address.
+type MaskPlanes = Vec<(Vec<crate::mask::FlatMask>, (usize, usize), Arc<Vec<f32>>)>;
+static MASK_PLANES: std::sync::Mutex<MaskPlanes> = std::sync::Mutex::new(Vec::new());
+const MAX_MASK_PLANES: usize = 16;
+
+/// The opacity masks of `item` at effect time `mt` as the op that ends its effect stage: their
+/// coverage of a `w`×`h` working image (`px_scale` working pixels per clip pixel), as
+/// `mask::apply_opacity_masks` applies it. None: no mask to apply.
+fn opacity_mask_op(item: &TrackItem, mt: Tick, px_scale: f32, w: usize, h: usize) -> Option<FxOp> {
+    let op = item.effect("opacity").filter(|e| e.enabled && !e.masks.is_empty())?;
+    let flat = crate::mask::prepare(&op.masks, mt, px_scale);
+    {
+        let mut planes = MASK_PLANES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = planes.iter().position(|(f, size, _)| *size == (w, h) && *f == flat) {
+            let hit = planes.remove(i);
+            let cov = hit.2.clone();
+            planes.push(hit);
+            return Some(FxOp::Mask { cov });
+        }
+    }
+    // rasterised without the lock: other frames' jobs plan meanwhile
+    let cov = Arc::new(crate::mask::coverage(&flat, w, h)?);
+    let mut planes = MASK_PLANES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if planes.len() >= MAX_MASK_PLANES {
+        planes.remove(0);
+    }
+    planes.push((flat, (w, h), cov.clone()));
+    Some(FxOp::Mask { cov })
 }
 
 /// Plan the frame at timeline `t` for a device that runs `caps`.
@@ -594,9 +627,10 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
         let input = if crate::colorman::needs_management(pipe, cs, &frame) { crate::colorman::gpu_input(project, item.item, pipe, cs, &frame) } else { None };
         let plain = (input.is_some() || !crate::colorman::needs_management(pipe, cs, &frame))
             && crate::media_interpolation(item, t, &src, seq.settings.frame_rate).is_none();
-        if plain && !chain.is_empty() {
+        let masked = item.has_opacity_masks();
+        if plain && (masked || !chain.is_empty()) {
             // GPU effect stage: the working image the CPU would decode (`base_layer`), the
-            // effects evaluated for it, placed as `item_layer` places it
+            // effects evaluated for it and the opacity masks, placed as `item_layer` places it
             let (fw, fh) = upright(&frame);
             let n = crate::decimation(fw as f32, size.0 as f32 * want);
             let (lw, lh) = ((fw as usize / n).max(1), (fh as usize / n).max(1));
@@ -614,7 +648,10 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
                 working: seq.settings.color.working,
             };
             let ops: Option<Vec<FxOp>> = chain.iter().map(|e| FxOp::eval(e, &cx, lw, lh).filter(FxOp::gpu_ok)).collect();
-            if let Some(ops) = ops {
+            if let Some(mut ops) = ops {
+                if masked {
+                    ops.extend(opacity_mask_op(item, mt, px_scale, lw, lh));
+                }
                 let m = Affine::scale(opts.scale as f64, opts.scale as f64)
                     .then_apply(&motion)
                     .then_apply(&Affine::scale(1.0 / px_scale as f64, 1.0 / px_scale as f64));

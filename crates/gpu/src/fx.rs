@@ -57,6 +57,10 @@ const OP_BOKEH_BOOST: u32 = 33;
 const OP_BOKEH: u32 = 34;
 const OP_BOKEH_UP: u32 = 35;
 const OP_THREE_WAY: u32 = 36;
+const OP_MASK: u32 = 100;
+
+/// Coverage planes of opacity masks kept as textures (a static mask is one plane for every frame).
+const MASK_PLANES: usize = 8;
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
@@ -72,6 +76,9 @@ pub(crate) struct FxStage {
     frames: u32,
     /// Working textures created so far (a steady stream of frames creates none).
     created: u64,
+    /// Uploaded coverage planes of [`FxOp::Mask`], most recently used last. The plane is kept so
+    /// its address stays its identity.
+    planes: Vec<(std::sync::Arc<Vec<f32>>, wgpu::TextureView)>,
 }
 
 /// One compute pass of a job.
@@ -105,6 +112,8 @@ struct Step {
     /// Bokeh Blur's gather: its kernel (`filmcraft_render::vfx::bokeh_kernel`), read as the aux
     /// texture.
     kernel: Vec<(i32, i32, f32)>,
+    /// An opacity mask's coverage plane (one value per pixel), read as the aux texture.
+    plane: Option<std::sync::Arc<Vec<f32>>>,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -112,7 +121,7 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new() }
+    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), plane: None }
 }
 
 /// Texels a row of a kernel texture holds.
@@ -321,6 +330,14 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
             ];
             out.push(step(OP_LUMETRI, [*creative_on as u32, *vignette_on as u32, 0, 0], &p));
         }
+        FxOp::Mask { cov } => {
+            // a plane of another size is a no-op, as on the CPU
+            if (w as usize).checked_mul(h as usize) == Some(cov.len()) {
+                let mut s = step(OP_MASK, [0; 4], &[]);
+                s.plane = Some(cov.clone());
+                out.push(s);
+            }
+        }
     }
     out
 }
@@ -407,7 +424,17 @@ impl FxStage {
             multiview_mask: None,
             cache: None,
         });
-        Self { px: compute("fx_px"), run: compute("fx_run"), bgl, source, pool: HashMap::new(), used: HashSet::new(), frames: 0, created: 0 }
+        Self {
+            px: compute("fx_px"),
+            run: compute("fx_run"),
+            bgl,
+            source,
+            pool: HashMap::new(),
+            used: HashSet::new(),
+            frames: 0,
+            created: 0,
+            planes: Vec::new(),
+        }
     }
 
     /// Start a frame: pooled textures of sizes no layer uses by [`end_frame`](Self::end_frame)
@@ -431,6 +458,12 @@ impl FxStage {
     #[cfg(test)]
     pub(crate) fn created(&self) -> u64 {
         self.created
+    }
+
+    /// Coverage planes held as textures.
+    #[cfg(test)]
+    pub(crate) fn mask_planes(&self) -> usize {
+        self.planes.len()
     }
 
     /// No working textures held.
@@ -461,6 +494,41 @@ impl FxStage {
             self.created = self.created.saturating_add(1);
         }
         v.iter().take(n).cloned().collect()
+    }
+
+    /// The texture of a mask's coverage plane (`w`×`h`, one `R32Float` texel per pixel), uploaded
+    /// once and found again by the plane's address.
+    fn plane_texture(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, cov: &std::sync::Arc<Vec<f32>>, w: u32, h: u32) -> wgpu::TextureView {
+        if let Some(i) = self.planes.iter().position(|(c, _)| std::sync::Arc::ptr_eq(c, cov)) {
+            let hit = self.planes.remove(i);
+            let view = hit.1.clone();
+            self.planes.push(hit);
+            return view;
+        }
+        let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+        let t = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("filmcraft-fx-mask"),
+            size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bytes: Vec<u8> = cov.iter().flat_map(|v| v.to_le_bytes()).collect();
+        queue.write_texture(
+            t.as_image_copy(),
+            &bytes,
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w.saturating_mul(4)), rows_per_image: Some(h) },
+            size,
+        );
+        let view = t.create_view(&Default::default());
+        if self.planes.len() >= MASK_PLANES {
+            self.planes.remove(0);
+        }
+        self.planes.push((cov.clone(), view.clone()));
+        view
     }
 
     /// Prepare the passes of `fx`, whose source draw uses `source_bg` (a layer bind group whose
@@ -495,7 +563,10 @@ impl FxStage {
             }
             let keep = if s.unsharp_blur || s.combine { orig } else { None };
             let dst = (0..n).find(|k| *k != cur && Some(*k) != keep)?;
-            let kernel = (!s.kernel.is_empty()).then(|| kernel_texture(device, queue, &s.kernel));
+            let kernel = match &s.plane {
+                Some(cov) => Some(self.plane_texture(device, queue, cov, w, h)),
+                None => (!s.kernel.is_empty()).then(|| kernel_texture(device, queue, &s.kernel)),
+            };
             let aux = match (s.combine, orig, &kernel) {
                 (true, Some(o), _) => views.get(o)?,
                 (_, _, Some(k)) => k,

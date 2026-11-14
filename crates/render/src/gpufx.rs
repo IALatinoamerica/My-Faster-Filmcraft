@@ -219,6 +219,12 @@ pub enum FxOp {
         aspect: f32,
         gpu_capable: bool,
     },
+    /// Opacity masks: every channel scaled by `cov`, the masks' coverage of each pixel of the
+    /// working image ([`crate::mask::effect_coverage`]), row by row. A plane of another size
+    /// leaves the image as it is.
+    Mask {
+        cov: std::sync::Arc<Vec<f32>>,
+    },
 }
 
 /// Effect ids [`FxOp::eval`] understands (the GPU-capable standard effects).
@@ -714,6 +720,7 @@ impl FxOp {
                     && fin(ht)
                     && fin(&[*va, *vmid, *vround, *vfeather, *aspect])
             }
+            FxOp::Mask { .. } => true,
         }
     }
 
@@ -986,6 +993,11 @@ impl FxOp {
                     };
                     dec(crate::vfx::lerp3(v, target, k))
                 });
+            }
+            FxOp::Mask { cov } => {
+                if cov.len().checked_mul(4) == Some(img.px.len()) {
+                    crate::mask::scale_by(img, cov);
+                }
             }
             FxOp::AlphaAdjust { opacity, ignore, invert, mask_only } => {
                 let (op, ignore, invert, mask_only) = (*opacity, *ignore, *invert, *mask_only);

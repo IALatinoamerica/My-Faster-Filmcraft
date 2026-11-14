@@ -516,6 +516,39 @@ fn gpu_effect_chains_match_cpu() {
     }
 }
 
+/// Opacity masks on the effect stage: the coverage plane scales every channel, as
+/// `mask::scale_by` does; a plane of another size is a no-op on both paths; and a plane is
+/// uploaded once however many frames use it.
+#[test]
+fn gpu_opacity_mask_op_matches_cpu_exactly() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (67u32, 41u32);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let cov: Vec<f32> = (0..w * h).map(|i| ((i % w) as f32 / (w - 1) as f32 * 1.5 - 0.25).clamp(0.0, 1.0)).collect();
+    let good = std::sync::Arc::new(cov);
+    let odd = std::sync::Arc::new(vec![0.0f32; 7]);
+    let blur = FxOp::eval(&effect("gaussian_blur", &[("blurriness", fl(6.0))]), &cx(Tick::ZERO, 1.0), w as usize, h as usize).expect("blur");
+    let chains = [vec![FxOp::Mask { cov: good.clone() }], vec![blur, FxOp::Mask { cov: good.clone() }], vec![FxOp::Mask { cov: odd }]];
+    for ops in chains {
+        assert!(ops.iter().all(FxOp::gpu_ok));
+        let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        for op in &ops {
+            op.apply(&mut cpu);
+        }
+        for _ in 0..2 {
+            let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, turns: 0, ops: ops.clone() }).expect("effect image");
+            let (worst, flips) = compare(&cpu.px, &gpu);
+            assert!(worst < EXACT * 2.0 && flips == 0.0, "{} ops: {worst}, {flips}", ops.len());
+        }
+    }
+    assert_eq!(c.fx.as_ref().map(|f| f.mask_planes()), Some(1), "one plane uploaded for every use of it");
+}
+
 /// Keyframed parameters are evaluated at the layer's time on the CPU: the GPU result follows them.
 #[test]
 fn keyframed_effects_follow_time() {
