@@ -42,6 +42,7 @@ full-frame adjustment layer over the whole sequence (copies of `SHORT TEST.fcpro
 | Twirl CAM / ADJ (no GPU version) | 1 / 0 | 2 / 0 | 3 / 0 |
 
 After 07 the process uses about 8 ms of CPU per frame in every project but Twirl (190 to 240 ms).
+After 03a and 03b the same projects show 568 to 581 of 600 (Twirl: 6 and 0).
 The frames still dropped are the ones the test projects without effects drop too: decoding.
 
 Plan 06 removes the full-frame canvas and its resample, but the camera's working image is the
