@@ -24,6 +24,8 @@ struct Recorder {
     ids: Vec<ffi::VASurfaceID>,
     decoded: Vec<bool>,
     pictures: usize,
+    /// Pictures read back.
+    reads: usize,
     frame: VideoFrame,
 }
 
@@ -31,7 +33,7 @@ impl Recorder {
     fn new(count: usize) -> Self {
         let g = Geometry { crop: (0, 0, 2, 2), bits: 8, color: Default::default(), par: (1, 1) };
         let frame = biplanar::to_frame(&Biplanar { luma: &[128; 4], chroma: &[128; 2], stride: 2, rows: 2 }, &g).unwrap();
-        Self { ids: (0..count as u32).map(|i| 0x100 + i).collect(), decoded: vec![false; count], pictures: 0, frame }
+        Self { ids: (0..count as u32).map(|i| 0x100 + i).collect(), decoded: vec![false; count], pictures: 0, reads: 0, frame }
     }
 }
 
@@ -130,6 +132,7 @@ impl Accel for Recorder {
 
     fn read(&mut self, index: usize) -> Result<VideoFrame, String> {
         assert!(self.decoded[index], "read back a decoded surface");
+        self.reads += 1;
         Ok(self.frame.clone())
     }
 
@@ -377,5 +380,44 @@ fn hevc_damaged_samples_are_errors() {
             }
         }
         let _ = f.flush();
+    }
+}
+
+/// Told which pictures nobody will show (`set_output_from`), the front ends decode every picture
+/// as before but read back and return only the others: the same pictures, in the same order, as
+/// without it.
+#[test]
+fn pictures_nobody_will_show_are_decoded_but_not_read_back() {
+    let ff = filmcraft_testkit::require_ffmpeg!();
+    for (name, profile, params) in STREAMS {
+        let Some(path) = fixture(&ff, name, profile, params) else { continue };
+        let s = read_stream(&path);
+        let all = run_front(&mut front(&s), &s.samples);
+        let from = s.samples[s.samples.len() / 2].1;
+        let mut f = front(&s);
+        f.set_output_from(Some(from));
+        let late: Vec<i64> = all.iter().copied().filter(|p| *p >= from).collect();
+        assert_eq!(run_front(&mut f, &s.samples), late, "{name}");
+        assert!(late.len() < all.len() && !late.is_empty(), "{name}");
+        assert_eq!((f.accel().pictures, f.accel().reads), (s.samples.len(), late.len()), "{name}: all decoded, the wanted ones read back");
+        // and every picture again once nothing is late
+        f.reset();
+        f.set_output_from(None);
+        assert_eq!(run_front(&mut f, &s.samples), all, "{name}");
+    }
+    for (name, pix_fmt, params) in HEVC_STREAMS {
+        let Some(path) = hevc_fixture(&ff, name, pix_fmt, params) else { continue };
+        let s = read_stream(&path);
+        let all = run_hevc(&mut hevc_front(&s), &s.samples);
+        let from = s.samples[s.samples.len() / 2].1;
+        let mut f = hevc_front(&s);
+        f.set_output_from(Some(from));
+        let late: Vec<i64> = all.iter().copied().filter(|p| *p >= from).collect();
+        assert_eq!(run_hevc(&mut f, &s.samples), late, "{name}");
+        assert!(late.len() < all.len() && !late.is_empty(), "{name}");
+        assert_eq!(f.accel().reads, late.len(), "{name}: only the wanted ones read back");
+        f.reset();
+        f.set_output_from(None);
+        assert_eq!(run_hevc(&mut f, &s.samples), all, "{name}");
     }
 }

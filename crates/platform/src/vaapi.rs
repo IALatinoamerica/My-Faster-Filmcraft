@@ -213,5 +213,12 @@ mod linux {
         fn is_disposable(&self, sample: &[u8]) -> bool {
             self.info.is_disposable(sample)
         }
+
+        fn set_output_from(&mut self, pts: Option<i64>) {
+            match &mut self.front {
+                Front::H264(f) => f.set_output_from(pts),
+                Front::Hevc(f) => f.set_output_from(pts),
+            }
+        }
     }
 }

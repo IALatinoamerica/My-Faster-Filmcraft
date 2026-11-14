@@ -1041,3 +1041,100 @@ fn release_idle_empties_idle_caches_and_leaves_one_in_use_alone() {
     assert_eq!(pool.bytes.load(Ordering::Relaxed), 0);
     assert_eq!(pool.decoders.load(Ordering::Relaxed), 0);
 }
+
+/// [`Samples`] whose decoders leave out the pictures before the time they are told
+/// ([`VideoDecoder::set_output_from`]), as a hardware decoder does, and note what they are told.
+struct Picky(Samples, Arc<Mutex<Vec<Option<i64>>>>);
+
+struct PickyDec {
+    inner: Box<dyn VideoDecoder>,
+    from: Option<i64>,
+    told: Arc<Mutex<Vec<Option<i64>>>>,
+}
+
+impl PickyDec {
+    fn wanted(&self, mut out: Vec<DecodedFrame>) -> Vec<DecodedFrame> {
+        out.retain(|f| self.from.is_none_or(|from| f.pts >= from));
+        out
+    }
+}
+
+impl VideoDecoder for PickyDec {
+    fn decode(&mut self, sample: &[u8], pts: i64) -> crate::Result<Vec<DecodedFrame>> {
+        let out = self.inner.decode(sample, pts)?;
+        Ok(self.wanted(out))
+    }
+    fn flush(&mut self) -> Vec<DecodedFrame> {
+        let out = self.inner.flush();
+        self.wanted(out)
+    }
+    fn reset(&mut self) {
+        self.inner.reset();
+    }
+    fn name(&self) -> &str {
+        "picky"
+    }
+    fn set_output_from(&mut self, pts: Option<i64>) {
+        self.from = pts;
+        self.told.lock().unwrap().push(pts);
+    }
+}
+
+impl VideoSamples for Picky {
+    fn count(&self) -> usize {
+        self.0.count()
+    }
+    fn pts(&self, i: usize) -> i64 {
+        self.0.pts(i)
+    }
+    fn sync_before(&self, i: usize) -> usize {
+        self.0.sync_before(i)
+    }
+    fn sample_at(&self, t: i64) -> Option<usize> {
+        self.0.sample_at(t)
+    }
+    fn read(&self, i: usize) -> crate::Result<Vec<u8>> {
+        self.0.read(i)
+    }
+    fn make_decoder(&self) -> crate::Result<Box<dyn VideoDecoder>> {
+        Ok(Box::new(PickyDec { inner: self.0.make_decoder()?, from: None, told: self.1.clone() }))
+    }
+}
+
+/// A seek for a frame on screen tells the decoder which pictures nobody will show: the ones more
+/// than [`RETURN_BEFORE`] samples before the wanted one. The wanted frame and the ones kept
+/// before it are cached; an earlier one is decoded again from the keyframe; and a request that
+/// names nothing late (a render, an export) gets every picture.
+#[test]
+fn a_seek_leaves_out_the_pictures_nobody_will_show() {
+    let s = Picky(samples(300, 250, 0, false), Default::default());
+    let (resets, decodes) = (s.0.resets.clone(), s.0.decodes.clone());
+    let c = GopCache::new(None);
+    // a scrub to sample 100: everything from the keyframe is decoded, the last 24 are kept
+    assert_eq!(index_of(&c.frame_late(&s, 100_000, Some(0)).expect("frame")), 100);
+    assert_eq!(s.1.lock().unwrap().last(), Some(&Some((100 - RETURN_BEFORE as i64) * 1000)));
+    assert_eq!((resets.load(Ordering::Relaxed), decodes.load(Ordering::Relaxed)), (1, 101));
+    // stepping back inside what was kept decodes nothing
+    for i in [99usize, 90, 100 - RETURN_BEFORE] {
+        assert_eq!(index_of(&c.frame_late(&s, i as i64 * 1000, Some(0)).expect("frame")), i);
+    }
+    assert_eq!(decodes.load(Ordering::Relaxed), 101);
+    // before that: decoded again from the keyframe, and it is the right picture
+    assert_eq!(index_of(&c.frame_late(&s, 50_000, Some(0)).expect("frame")), 50);
+    assert_eq!((resets.load(Ordering::Relaxed), decodes.load(Ordering::Relaxed)), (2, 152));
+    // the frame due during playback: every picture before it is late
+    assert_eq!(index_of(&c.frame_late(&s, 60_000, Some(60_000)).expect("frame")), 60);
+    assert_eq!(s.1.lock().unwrap().last(), Some(&Some(60_000)));
+    // a render names nothing late: every picture on the way is returned and cached
+    let s2 = Picky(samples(300, 250, 0, false), Default::default());
+    let c2 = GopCache::new(None);
+    assert_eq!(index_of(&c2.frame(&s2, 100_000).expect("frame")), 100);
+    assert_eq!(s2.1.lock().unwrap().last(), Some(&None));
+    assert_eq!(index_of(&c2.frame(&s2, 40_000).expect("frame")), 40);
+    assert_eq!(s2.0.decodes.load(Ordering::Relaxed), 101, "sample 40 was cached");
+    // near the start of the track and at a time before it, nothing underflows
+    let s3 = Picky(samples(300, 250, 0, false), Default::default());
+    let c3 = GopCache::new(None);
+    assert_eq!(index_of(&c3.frame_late(&s3, 3_000, Some(i64::MIN)).expect("frame")), 3);
+    assert_eq!(index_of(&c3.frame_late(&s3, 5_000, Some(i64::MAX)).expect("frame")), 5);
+}

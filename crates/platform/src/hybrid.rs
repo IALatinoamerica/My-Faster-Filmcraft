@@ -262,6 +262,13 @@ impl VideoDecoder for HybridDecoder {
             sw.set_draft(on);
         }
     }
+
+    fn set_output_from(&mut self, pts: Option<i64>) {
+        // the software decoder returns its pictures for free
+        if let Some(hw) = self.hw.as_mut() {
+            hw.set_output_from(pts);
+        }
+    }
 }
 
 #[cfg(test)]

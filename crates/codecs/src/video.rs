@@ -45,6 +45,12 @@ pub trait VideoDecoder: Send {
     /// shortcuts that only change pictures nothing references, which come out flagged
     /// [`DecodedFrame::draft`]. Decoders without such a mode ignore it.
     fn set_draft(&mut self, _on: bool) {}
+    /// Pictures presented before `pts` are wanted by nobody (a seek decodes them only because
+    /// the wanted picture is predicted from them): a decoder whose pictures cost something to
+    /// hand over (a hardware decoder reads each back from the GPU) may leave them out of what
+    /// [`Self::decode`] and [`Self::flush`] return from now on. `None`: every picture is
+    /// returned (the default). Decoders that return pictures for free ignore it.
+    fn set_output_from(&mut self, _pts: Option<i64>) {}
     /// Made with fewer worker threads than a decoder for playback gets, because it was made for
     /// background work ([`filmcraft_media::cancel::with_background`]). A request for a monitor
     /// replaces such a decoder.

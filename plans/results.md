@@ -16,6 +16,7 @@
 | 01 masks on the GPU | 551 | 551 | 0 | 535 | 8.7 | 607 / 925 |
 | 02 shutter Transform on the GPU | 554 | 543 | 598 | 537 | 8.4 | 524 / 841 |
 | 03a sources fetched side by side | 549 | 555 | 598 | 530 | 9.3 | 372 / 556 |
+| 03b no read-back for pictures nobody will show | 583 | 583 | 598 | 569 | 8.4 | 272 / 405 |
 
 Notes from the baseline:
 
@@ -48,3 +49,17 @@ full 1920×1080 frame (it is shown at 51.5 %, above the half size at which a red
 decoded), so a CPU effect on it still costs a full-frame float image and its upload per frame.
 It is restricted to media clips: a transformed nested sequence placed by the GPU did not match
 the CPU picture (`export_renderer::tests::transformed_nested_picture_matches_cpu`).
+
+## VA-API time per picture on this GPU (measured with temporary counters, before 03b)
+
+| Step | ms per picture |
+|---|---|
+| Submitting the picture | 0.1 to 0.6 |
+| Waiting for the GPU to decode it (`vaSyncSurface`) | 1.5 to 2.4 |
+| Copying it out of video memory (`vaGetImage`) | 1.2 to 2.2 |
+| Mapping the copy and splitting the chroma plane | 0.6 to 1.8 |
+
+Read-back is about half of what a picture costs. 03b skips it for the pictures a seek decodes
+only as references: all but the 24 samples before the wanted one. The frames still dropped in
+Play A and Play C (17 and 31 of 600) fall at cuts, where a decoder starts from a keyframe; that is
+plan 03c.

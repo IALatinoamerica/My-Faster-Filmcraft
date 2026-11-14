@@ -527,6 +527,13 @@ const MIN_FRAMES: usize = 64;
 /// reserve above into an unbounded number of full-resolution copies.
 const FRAME_CACHE_CEILING: usize = 384 << 20;
 
+/// A seek for a frame on screen (a scrub, or playback catching up) still has the pictures of this
+/// many samples before the wanted one returned and cached, for stepping and scrubbing back; the
+/// ones before them are decoded as references only ([`VideoDecoder::set_output_from`]). A
+/// hardware decoder reads every returned picture back from the GPU, about half of what a picture
+/// costs it.
+const RETURN_BEFORE: usize = 24;
+
 /// A running decoder up to this many samples before the wanted sample's sync sample keeps going
 /// rather than restarting at the sync sample.
 const CONTINUE_THROUGH: usize = 48;
@@ -882,6 +889,8 @@ impl GopCache {
             return Err(CodecError::Decode("no video decoder".into()));
         };
         decoder.set_draft(draft);
+        // only a request that says what is late leaves pictures out: renders and exports want all
+        decoder.set_output_from(late_before.map(|_| late.max(s.pts(i.saturating_sub(RETURN_BEFORE))).min(want_pts)));
         while st.next < limit {
             if filmcraft_media::cancel::cancelled() {
                 // The decoder state stays consistent (`next`, `out_max`): a later request continues.

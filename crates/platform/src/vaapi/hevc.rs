@@ -69,6 +69,8 @@ pub struct Front<A: Accel> {
     first_picture: bool,
     skip_rasl: bool,
     after_eos: bool,
+    /// Pictures presented before this are not read back.
+    output_from: Option<i64>,
 }
 
 fn decode_err(e: impl std::fmt::Display) -> CodecError {
@@ -98,6 +100,7 @@ impl<A: Accel> Front<A> {
             first_picture: true,
             skip_rasl: false,
             after_eos: false,
+            output_from: None,
         };
         let mut frames = Vec::new();
         for nal in parameter_sets {
@@ -144,9 +147,18 @@ impl<A: Accel> Front<A> {
         self.after_eos = false;
     }
 
+    /// Pictures presented before `pts` are no longer read back (`VideoDecoder::set_output_from`).
+    pub fn set_output_from(&mut self, pts: Option<i64>) {
+        self.output_from = pts;
+    }
+
     /// Read back the pictures the DPB output, right away: a surface leaving the DPB is reused.
     fn read_out(&mut self, outs: Vec<Output<Surface>>, frames: &mut Vec<DecodedFrame>) -> Result<()> {
         for o in outs {
+            // a picture nobody will show is not read back (it stays a reference in its surface)
+            if self.output_from.is_some_and(|from| o.meta.pts < from) {
+                continue;
+            }
             let frame = self.accel.read(o.frame.index).map_err(decode_err)?;
             frames.push(DecodedFrame { pts: o.meta.pts, frame, draft: false });
         }
