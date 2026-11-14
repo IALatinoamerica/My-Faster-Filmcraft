@@ -1502,3 +1502,47 @@ fn lengths_past_the_picture_keep_their_fade_and_weighting() {
     let (glint_32, glint_320) = (total(&render("glint", 32.0)), total(&render("glint", 320.0)));
     assert!((glint_32 - glint_320).abs() > 0.01 * glint_32.abs(), "glint weighting follows the requested length: {glint_32} vs {glint_320}");
 }
+
+/// Transform with its own shutter angle is rendered by `gpufx` (the GPU's reference) with the
+/// picture `transform_fx` makes: seven placements across the shutter's open time while the
+/// keyframes move, and one placement once they are over.
+#[test]
+fn shutter_transform_matches_its_seven_sample_reference() {
+    use crate::gpufx::FxOp;
+    let img = picture(96, 54);
+    let mut e = inst("transform");
+    set(&mut e, "shutter_override", ParamValue::Bool(true));
+    setf(&mut e, "shutter_angle", 360.0);
+    let p = e.params.get_mut("scale_height").unwrap();
+    p.put_keyframe(Tick::ZERO, ParamValue::Float(100.0));
+    p.put_keyframe(Tick::from_seconds_f64(1.0), ParamValue::Float(170.0));
+    let p = e.params.get_mut("position").unwrap();
+    p.put_keyframe(Tick::ZERO, ParamValue::Vec2(filmcraft_geom::Vec2::new(48.0, 27.0)));
+    p.put_keyframe(Tick::from_seconds_f64(1.0), ParamValue::Vec2(filmcraft_geom::Vec2::new(60.0, 40.0)));
+    for (s, moving) in [(0.5, true), (3.0, false)] {
+        let cx = FxCtx { t: Tick::from_seconds_f64(s), seconds: s, ..cx() };
+        let op = FxOp::eval(&e, &cx, img.w, img.h).expect("an op for a magnifying Transform");
+        assert_eq!(matches!(op, FxOp::ResampleBlur { .. }), moving, "t = {s}");
+        assert_eq!(matches!(op, FxOp::Resample(_)), !moving, "t = {s}");
+        assert!(op.gpu_ok(), "t = {s}");
+        let mut reference = img.clone();
+        distort::transform_fx(&mut reference, &e, &cx);
+        let got = run("transform", &e, &img, &cx);
+        assert!(max_diff(&got, &reference) < 1e-5, "t = {s}: {}", max_diff(&got, &reference));
+        assert!(max_diff(&got, &img) > 0.05, "t = {s}: the picture is transformed");
+    }
+    // a zoom out by half and more takes the CPU's mip path: left to `transform_fx`
+    setf(&mut e, "scale_height", 100.0);
+    let p = e.params.get_mut("scale_height").unwrap();
+    p.put_keyframe(Tick::ZERO, ParamValue::Float(100.0));
+    p.put_keyframe(Tick::from_seconds_f64(1.0), ParamValue::Float(20.0));
+    let late = FxCtx { t: Tick::from_seconds_f64(0.9), seconds: 0.9, ..cx() };
+    assert!(FxOp::eval(&e, &late, img.w, img.h).is_none());
+    // hostile shutter angles and frame rates plan and render without panicking
+    for (angle, fps) in [(f64::NAN, 24.0), (f64::INFINITY, 24.0), (1e300, 24.0), (180.0, f64::NAN), (180.0, 0.0), (180.0, -5.0)] {
+        setf(&mut e, "shutter_angle", angle);
+        let hostile = FxCtx { frame_rate: fps, ..cx() };
+        let _ = FxOp::eval(&e, &hostile, img.w, img.h);
+        let _ = run("transform", &e, &img, &hostile);
+    }
+}

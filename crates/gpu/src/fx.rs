@@ -58,6 +58,7 @@ const OP_BOKEH: u32 = 34;
 const OP_BOKEH_UP: u32 = 35;
 const OP_THREE_WAY: u32 = 36;
 const OP_MASK: u32 = 100;
+const OP_RESAMPLE_ACC: u32 = 101;
 
 /// Coverage planes of opacity masks kept as textures (a static mask is one plane for every frame).
 const MASK_PLANES: usize = 8;
@@ -114,6 +115,10 @@ struct Step {
     kernel: Vec<(i32, i32, f32)>,
     /// An opacity mask's coverage plane (one value per pixel), read as the aux texture.
     plane: Option<std::sync::Arc<Vec<f32>>>,
+    /// A pass of a sum over several placements of the original (Transform's shutter blur): reads
+    /// the sum so far and, as the aux texture, the original, which stays untouched until the last
+    /// pass (`combine`).
+    reads_orig: bool,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -121,7 +126,7 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), plane: None }
+    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), plane: None, reads_orig: false }
 }
 
 /// Texels a row of a kernel texture holds.
@@ -329,6 +334,20 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
                 0.0,
             ];
             out.push(step(OP_LUMETRI, [*creative_on as u32, *vignette_on as u32, 0, 0], &p));
+        }
+        FxOp::ResampleBlur { samples } => {
+            let k = 1.0 / samples.len().max(1) as f32;
+            for (i, r) in samples.iter().enumerate() {
+                let first = if i == 0 { 1.0 } else { 0.0 };
+                let op = if (r.opacity - 1.0).abs() < 1e-6 { 1.0 } else { r.opacity };
+                let mut s = match &r.inv {
+                    Some(m) => step(OP_RESAMPLE_ACC, r.rect, &[m.a as f32, m.b as f32, m.c as f32, m.d as f32, m.e as f32, m.f as f32, op, 1.0, first, k]),
+                    None => step(OP_RESAMPLE_ACC, [0; 4], &[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, first, k]),
+                };
+                s.reads_orig = true;
+                s.combine = i + 1 == samples.len();
+                out.push(s);
+            }
         }
         FxOp::Mask { cov } => {
             // a plane of another size is a no-op, as on the CPU
@@ -558,16 +577,16 @@ impl FxStage {
         let mut orig: Option<usize> = None;
         for s in &all {
             // (an Unsharp without blur passes, radius 0, combines the original with itself)
-            if (s.unsharp_blur || s.combine) && orig.is_none() {
+            if (s.unsharp_blur || s.combine || s.reads_orig) && orig.is_none() {
                 orig = Some(cur);
             }
-            let keep = if s.unsharp_blur || s.combine { orig } else { None };
+            let keep = if s.unsharp_blur || s.combine || s.reads_orig { orig } else { None };
             let dst = (0..n).find(|k| *k != cur && Some(*k) != keep)?;
             let kernel = match &s.plane {
                 Some(cov) => Some(self.plane_texture(device, queue, cov, w, h)),
                 None => (!s.kernel.is_empty()).then(|| kernel_texture(device, queue, &s.kernel)),
             };
-            let aux = match (s.combine, orig, &kernel) {
+            let aux = match (s.combine || s.reads_orig, orig, &kernel) {
                 (true, Some(o), _) => views.get(o)?,
                 (_, _, Some(k)) => k,
                 _ => dummy,

@@ -56,6 +56,7 @@ const OP_BOKEH: u32 = 34u;
 const OP_BOKEH_UP: u32 = 35u;
 const OP_THREE_WAY: u32 = 36u;
 const OP_MASK: u32 = 100u;
+const OP_RESAMPLE_ACC: u32 = 101u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -87,6 +88,32 @@ fn sample_bilinear(x: f32, y: f32) -> vec4<f32> {
     let b = ld_or_clear(i + vec2(1, 0));
     let c = ld_or_clear(i + vec2(0, 1));
     let d = ld_or_clear(i + vec2(1, 1));
+    let top = a + (b - a) * tx;
+    let bot = c + (d - c) * tx;
+    return top + (bot - top) * ty;
+}
+
+// `sample_bilinear` of the aux texture (the original of a sum of placements).
+fn aux_or_clear(p: vec2<i32>) -> vec4<f32> {
+    let s = size();
+    if p.x < 0 || p.y < 0 || p.x >= s.x || p.y >= s.y {
+        return vec4(0.0);
+    }
+    return textureLoad(aux, p, 0);
+}
+
+fn sample_bilinear_aux(x: f32, y: f32) -> vec4<f32> {
+    let fx = x - 0.5;
+    let fy = y - 0.5;
+    let x0 = floor(fx);
+    let y0 = floor(fy);
+    let tx = fx - x0;
+    let ty = fy - y0;
+    let i = vec2<i32>(i32(x0), i32(y0));
+    let a = aux_or_clear(i);
+    let b = aux_or_clear(i + vec2(1, 0));
+    let c = aux_or_clear(i + vec2(0, 1));
+    let d = aux_or_clear(i + vec2(1, 1));
     let top = a + (b - a) * tx;
     let bot = c + (d - c) * tx;
     return top + (bot - top) * ty;
@@ -746,6 +773,24 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
                 return vec4(0.0);
             }
             return sample_bilinear(uu, vv) * m1.z;
+        }
+        case OP_RESAMPLE_ACC: {
+            // one placement of the original (aux) added to the sum so far (src): the inverse map
+            // and rect of OP_RESAMPLE, p2 = (first pass, 1 / placements)
+            var acc = vec4(0.0);
+            if u.p2.x == 0.0 {
+                acc = ld(p);
+            }
+            if u.p1.w == 0.0 || u32(p.x) < u.i1.x || u32(p.x) >= u.i1.y || u32(p.y) < u.i1.z || u32(p.y) >= u.i1.w {
+                return acc;
+            }
+            let m0 = u.p0; let m1 = u.p1;
+            let uu = m0.x * pc.x + m0.z * pc.y + m1.x;
+            let vv = m0.y * pc.x + m0.w * pc.y + m1.y;
+            if uu < -1.0 || vv < -1.0 || uu > f32(s.x) + 1.0 || vv > f32(s.y) + 1.0 {
+                return acc;
+            }
+            return acc + sample_bilinear_aux(uu, vv) * (m1.z * u.p2.y);
         }
         case OP_HFLIP: {
             return ld(vec2(s.x - 1 - p.x, p.y));

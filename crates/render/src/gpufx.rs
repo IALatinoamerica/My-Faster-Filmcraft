@@ -29,6 +29,15 @@ pub struct Resample {
     pub opacity: f32,
 }
 
+impl Resample {
+    /// Whether the GPU shader reproduces this resample: finite numbers, and not the CPU's mip path.
+    fn gpu_ok(&self) -> bool {
+        self.rect[0] != u32::MAX
+            && self.opacity.is_finite()
+            && self.inv.as_ref().is_none_or(|m| [m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite() && v.abs() < 1e7))
+    }
+}
+
 /// One evaluated effect.
 #[derive(Clone, Debug, PartialEq)]
 pub enum FxOp {
@@ -225,6 +234,11 @@ pub enum FxOp {
     Mask {
         cov: std::sync::Arc<Vec<f32>>,
     },
+    /// Transform with its own shutter angle: the mean of the working image placed by each of
+    /// `samples` (the motion while the shutter is open).
+    ResampleBlur {
+        samples: Vec<Resample>,
+    },
 }
 
 /// Effect ids [`FxOp::eval`] understands (the GPU-capable standard effects).
@@ -266,6 +280,35 @@ pub const GPU_EFFECTS: &[&str] = &[
     "video_limiter",
     "lumetri",
 ];
+
+/// Pictures a Transform with its own shutter angle is blurred over.
+const SHUTTER_SAMPLES: usize = 7;
+
+/// Transform's placement of a `w`×`h` working image at `cx`'s time. A map that minifies enough
+/// for the CPU's mip path is marked with `rect` `u32::MAX` (CPU only).
+fn transform_resample(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Resample {
+    let img = Image { w, h, px: Vec::new() };
+    let anchor = point(e, "anchor", cx, &img);
+    let pos = point(e, "position", cx, &img);
+    let sh = f(e, "scale_height", cx) as f64 / 100.0;
+    let sw = if b(e, "uniform_scale") { sh } else { f(e, "scale_width", cx) as f64 / 100.0 };
+    let rot = f(e, "rotation", cx) as f64;
+    let skew = (f(e, "skew", cx) as f64).to_radians().tan();
+    let skew_axis = f(e, "skew_axis", cx) as f64;
+    let op = f(e, "opacity", cx) / 100.0;
+    let sk = Affine::rotate_deg(skew_axis).then_apply(&Affine { a: 1.0, b: 0.0, c: skew, d: 1.0, e: 0.0, f: 0.0 }).then_apply(&Affine::rotate_deg(-skew_axis));
+    let m = Affine::translate(pos.x, pos.y)
+        .then_apply(&Affine::rotate_deg(rot))
+        .then_apply(&sk)
+        .then_apply(&Affine::scale(sw, sh))
+        .then_apply(&Affine::translate(-anchor.x, -anchor.y));
+    if minifies(&m, w, h) {
+        // the CPU's mip path (`Image::transformed` with the forward map; `rect`
+        // u32::MAX marks it): CPU only
+        return Resample { inv: Some(m), rect: [u32::MAX; 4], opacity: op };
+    }
+    resample(w, h, &m, op)
+}
 
 /// `Image::transformed` without the mip path: the destination rectangle it writes and the inverse.
 fn resample(w: usize, h: usize, m: &Affine, opacity: f32) -> Resample {
@@ -473,35 +516,42 @@ impl FxOp {
                 FxOp::crop_rect(w, h, 0.0, 0.0, 0.0, 0.0, amt)
             }
             "transform" => {
-                // With its own shutter angle the CPU blurs the motion over seven samples
-                // (`vfx::distort::transform_fx`, under the same condition); the GPU op places one
-                // picture, so this stays on the CPU rather than losing the blur
-                if crate::vfx::bv(e, "shutter_override") && crate::vfx::fv(e, "shutter_angle", cx) > 0.5 {
+                if !(crate::vfx::bv(e, "shutter_override") && crate::vfx::fv(e, "shutter_angle", cx) > 0.5) {
+                    return Some(FxOp::Resample(transform_resample(e, cx, w, h)));
+                }
+                // With its own shutter angle the motion is blurred over seven samples across the
+                // shutter's open time, as `vfx::distort::transform_fx` takes them.
+                let span = (crate::vfx::fv(e, "shutter_angle", cx) as f64 / 360.0) / cx.frame_rate.max(1.0);
+                // (an open time no shutter has: left to `transform_fx`, as before)
+                if !(span.is_finite() && span <= 1.0) {
                     return None;
                 }
-                let img = Image { w, h, px: Vec::new() };
-                let anchor = point(e, "anchor", cx, &img);
-                let pos = point(e, "position", cx, &img);
-                let sh = f(e, "scale_height", cx) as f64 / 100.0;
-                let sw = if b(e, "uniform_scale") { sh } else { f(e, "scale_width", cx) as f64 / 100.0 };
-                let rot = f(e, "rotation", cx) as f64;
-                let skew = (f(e, "skew", cx) as f64).to_radians().tan();
-                let skew_axis = f(e, "skew_axis", cx) as f64;
-                let op = f(e, "opacity", cx) / 100.0;
-                let sk = Affine::rotate_deg(skew_axis)
-                    .then_apply(&Affine { a: 1.0, b: 0.0, c: skew, d: 1.0, e: 0.0, f: 0.0 })
-                    .then_apply(&Affine::rotate_deg(-skew_axis));
-                let m = Affine::translate(pos.x, pos.y)
-                    .then_apply(&Affine::rotate_deg(rot))
-                    .then_apply(&sk)
-                    .then_apply(&Affine::scale(sw, sh))
-                    .then_apply(&Affine::translate(-anchor.x, -anchor.y));
-                if minifies(&m, w, h) {
-                    // the CPU's mip path (`Image::transformed` with the forward map; `rect`
-                    // u32::MAX marks it): CPU only
-                    return Some(FxOp::Resample(Resample { inv: Some(m), rect: [u32::MAX; 4], opacity: op }));
+                let mut samples: Vec<Resample> = (0..SHUTTER_SAMPLES)
+                    .map(|i| {
+                        let k = i as f64 / (SHUTTER_SAMPLES - 1) as f64 - 0.5;
+                        let at = FxCtx {
+                            t: cx.t + filmcraft_time::Tick::from_seconds_f64(k * span),
+                            px_scale: cx.px_scale,
+                            seconds: cx.seconds + k * span,
+                            timecode: cx.timecode,
+                            clip_name: cx.clip_name,
+                            project: cx.project,
+                            env: cx.env,
+                            frame_rate: cx.frame_rate,
+                            working: cx.working,
+                        };
+                        transform_resample(e, &at, w, h)
+                    })
+                    .collect();
+                // a sample that minifies takes the CPU's mip path: `transform_fx` renders the effect
+                if samples.iter().any(|r| r.rect[0] == u32::MAX) {
+                    return None;
                 }
-                FxOp::Resample(resample(w, h, &m, op))
+                // nothing moves while the shutter is open (a held zoom): one picture
+                if samples.windows(2).all(|p| p[0] == p[1]) {
+                    return samples.pop().map(FxOp::Resample);
+                }
+                FxOp::ResampleBlur { samples }
             }
             "horizontal_flip" => FxOp::HFlip,
             "vertical_flip" => FxOp::VFlip,
@@ -699,11 +749,8 @@ impl FxOp {
             FxOp::Bokeh { boost, threshold, sides, rot, rr, rings, .. } => fin(&[*boost, *threshold, *rot, *rr]) && *sides <= 8 && *rings <= 12,
             FxOp::Unsharp { amount, threshold, .. } => fin(&[*amount, *threshold]),
             FxOp::Crop { x0, x1, y0, y1, feather } => fin(&[*x0, *x1, *y0, *y1, *feather]),
-            FxOp::Resample(r) => {
-                r.rect[0] != u32::MAX
-                    && r.opacity.is_finite()
-                    && r.inv.as_ref().is_none_or(|m| [m.a, m.b, m.c, m.d, m.e, m.f].iter().all(|v| v.is_finite() && v.abs() < 1e7))
-            }
+            FxOp::Resample(r) => r.gpu_ok(),
+            FxOp::ResampleBlur { samples } => samples.len() <= 16 && samples.iter().all(Resample::gpu_ok),
             FxOp::Mirror { cx, cy, nx, ny } => fin(&[*cx, *cy, *nx, *ny]),
             FxOp::Offset { dx, dy, blend } => fin(&[*dx, *dy, *blend]),
             FxOp::AscCdl { slope, offset, power, sat } => fin(slope) && fin(offset) && fin(power) && sat.is_finite(),
@@ -915,6 +962,25 @@ impl FxOp {
                 };
                 *img = out;
                 img.scale_alpha(r.opacity);
+            }
+            FxOp::ResampleBlur { samples } => {
+                if samples.is_empty() {
+                    return;
+                }
+                let parts: Vec<Image> = samples
+                    .par_iter()
+                    .map(|r| {
+                        let mut part = match (&r.inv, r.rect[0]) {
+                            (Some(m), u32::MAX) => img.transformed(img.w, img.h, m),
+                            (Some(inv), _) => resample_cpu(img, inv, r.rect),
+                            (None, _) => Image::new(img.w, img.h),
+                        };
+                        part.scale_alpha(r.opacity);
+                        part
+                    })
+                    .collect();
+                let inv = 1.0 / parts.len() as f32;
+                img.px.par_iter_mut().enumerate().for_each(|(i, v)| *v = parts.iter().map(|p| p.px.get(i).copied().unwrap_or(0.0)).sum::<f32>() * inv);
             }
             FxOp::HFlip => {
                 let w = img.w;
@@ -1286,7 +1352,7 @@ mod tests {
     /// (`vfx::distort::transform_fx`). The GPU op has no such blur, so that effect must leave
     /// the GPU chain instead of silently losing its blur in the Program monitor and GPU exports.
     #[test]
-    fn transform_with_its_own_shutter_angle_stays_on_the_cpu() {
+    fn transform_with_its_own_shutter_angle_runs_on_the_gpu_unless_it_shrinks() {
         let cx = FxCtx {
             t: Tick::ZERO,
             px_scale: 1.0,
@@ -1303,7 +1369,10 @@ mod tests {
         e.params.get_mut("position").unwrap().value = ParamValue::Vec2(filmcraft_geom::Vec2::new(40.0, 20.0));
         assert!(on_gpu(&e), "a plain transform runs on the GPU");
         e.params.get_mut("shutter_override").unwrap().value = ParamValue::Bool(true);
-        assert!(!on_gpu(&e), "the default 180° shutter blurs the motion: CPU");
+        assert!(on_gpu(&e), "the default 180° shutter with nothing moving is one picture");
+        e.params.get_mut("scale_height").unwrap().value = ParamValue::Float(40.0);
+        assert!(FxOp::eval(&e, &cx, 64, 36).is_none(), "a shutter Transform that shrinks the frame (the CPU's mip path): CPU");
+        e.params.get_mut("scale_height").unwrap().value = ParamValue::Float(100.0);
         e.params.get_mut("shutter_angle").unwrap().value = ParamValue::Float(0.0);
         assert!(on_gpu(&e), "a closed shutter blurs nothing");
         e.params.get_mut("shutter_override").unwrap().value = ParamValue::Bool(false);

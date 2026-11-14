@@ -549,6 +549,48 @@ fn gpu_opacity_mask_op_matches_cpu_exactly() {
     assert_eq!(c.fx.as_ref().map(|f| f.mask_planes()), Some(1), "one plane uploaded for every use of it");
 }
 
+/// Transform with its own shutter angle: the mean of seven placements of the picture, summed
+/// pass by pass from the untouched original, alone and between other effects.
+#[test]
+fn gpu_shutter_transform_matches_cpu_exactly() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (96u32, 54u32);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let mut zoom = effect("transform", &[("shutter_override", ParamValue::Bool(true)), ("shutter_angle", fl(360.0)), ("opacity", fl(80.0))]);
+    let p = zoom.params.get_mut("scale_height").expect("scale");
+    p.put_keyframe(Tick::ZERO, fl(100.0));
+    p.put_keyframe(Tick::from_seconds_f64(1.0), fl(190.0));
+    let p = zoom.params.get_mut("rotation").expect("rotation");
+    p.put_keyframe(Tick::ZERO, fl(0.0));
+    p.put_keyframe(Tick::from_seconds_f64(1.0), fl(40.0));
+    let p = zoom.params.get_mut("position").expect("position");
+    p.put_keyframe(Tick::ZERO, pt(48.0, 27.0));
+    p.put_keyframe(Tick::from_seconds_f64(1.0), pt(20.0, 60.0));
+    let blur = effect("gaussian_blur", &[("blurriness", fl(5.0))]);
+    let tint = effect("tint", &[("amount", fl(60.0))]);
+    for s in [0.2, 0.6, 0.97] {
+        let cx = cx(Tick::from_seconds_f64(s), 1.0);
+        for chain in [vec![&zoom], vec![&blur, &zoom, &tint], vec![&zoom, &zoom]] {
+            let ops: Vec<FxOp> = chain.iter().filter_map(|e| FxOp::eval(e, &cx, w as usize, h as usize)).collect();
+            assert_eq!(ops.len(), chain.len());
+            assert!(ops.iter().any(|op| matches!(op, FxOp::ResampleBlur { samples } if samples.len() == 7)), "t = {s}: the zoom moves");
+            assert!(ops.iter().all(FxOp::gpu_ok));
+            let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+            for op in &ops {
+                op.apply(&mut cpu);
+            }
+            let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, turns: 0, ops }).expect("effect image");
+            let (worst, flips) = compare(&cpu.px, &gpu);
+            assert!(worst < EXACT * 2.0 && flips == 0.0, "t = {s}, {} effects: {worst}, {flips}", chain.len());
+        }
+    }
+}
+
 /// Keyframed parameters are evaluated at the layer's time on the CPU: the GPU result follows them.
 #[test]
 fn keyframed_effects_follow_time() {

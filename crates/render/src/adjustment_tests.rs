@@ -483,11 +483,12 @@ fn an_adjustment_layer_the_gpu_cant_run_plans_the_frame_on_the_cpu() {
             }),
         ),
         (
-            "a Transform with a shutter angle (motion blur)",
+            "a Transform with a shutter angle (motion blur) that shrinks the frame",
             Box::new(|s, a| {
                 fx(s, a, "transform");
                 set(s, a, "transform", "shutter_override", ParamValue::Bool(true));
                 set(s, a, "transform", "shutter_angle", ParamValue::Float(180.0));
+                set(s, a, "transform", "scale_height", ParamValue::Float(40.0));
             }),
         ),
         ("opacity 50 %", Box::new(|s, a| set(s, a, "opacity", "opacity", ParamValue::Float(50.0)))),
@@ -642,5 +643,39 @@ fn an_adjustment_layer_that_does_nothing_is_not_a_step() {
         assert!(!crate::plan::is_cpu_frame(&s.p, s.seq, t, RenderOptions::default(), caps), "{what}: not a CPU frame");
         let d = max_diff(&crate::plan::execute_cpu(&plan), &render(&s));
         assert!(d < 1e-4, "{what}: plan vs CPU renderer max diff {d}");
+    }
+}
+
+/// An adjustment layer whose Transform has its own shutter angle is a step of the GPU plan, while
+/// the zoom moves and once it holds, with the reference renderer's picture; it used to send the
+/// whole frame to the CPU.
+#[test]
+fn a_shutter_transform_adjustment_layer_plans_for_the_gpu() {
+    use crate::gpufx::FxOp;
+    use crate::plan::{DeviceCaps, FramePlan, PlanStep, execute_cpu, plan_frame};
+    let mut s = scene(2);
+    let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
+    place(&mut s.p, s.seq, 0, ocean);
+    let adj = adjustment(&mut s.p, s.seq, 1);
+    fx(&mut s, adj, "transform");
+    {
+        let e = clip(&mut s, adj).effect_mut("transform").unwrap();
+        e.params.get_mut("shutter_override").unwrap().value = ParamValue::Bool(true);
+        e.params.get_mut("shutter_angle").unwrap().value = ParamValue::Float(360.0);
+        let p = e.params.get_mut("scale_height").unwrap();
+        p.put_keyframe(Tick::ZERO, ParamValue::Float(100.0));
+        p.put_keyframe(R.tick_of(12), ParamValue::Float(170.0));
+    }
+    for (frame, moving) in [(6, true), (30, false)] {
+        let t = R.tick_of(frame);
+        let plan = plan_frame(&s.p, s.seq, t, RenderOptions::default(), DeviceCaps::ALL, &s.map);
+        let FramePlan::Composite { steps, .. } = &plan else { panic!("frame {frame}: planned as one CPU image") };
+        let ops = steps.iter().find_map(|st| if let PlanStep::Adjust { ops } = st { Some(ops) } else { None }).expect("an adjustment step");
+        assert_eq!(matches!(ops.as_slice(), [FxOp::ResampleBlur { .. }]), moving, "frame {frame}");
+        assert_eq!(matches!(ops.as_slice(), [FxOp::Resample(_)]), !moving, "frame {frame}");
+        let reference = render_sequence(&s.p, s.seq, t, RenderOptions::default(), &s.map);
+        let got = execute_cpu(&plan);
+        let max = got.px.iter().zip(&reference.px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(max < 0.02, "frame {frame}: max diff {max}");
     }
 }
