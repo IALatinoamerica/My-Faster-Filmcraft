@@ -4,7 +4,8 @@
 
 After stage 1 some things still render on the CPU. Each must be named before Bruno hits play:
 which track, which clip, from when to when, why, and whether it costs one layer or the whole
-frame. This stage builds the list and a command that returns it; stage 3 shows it in the app.
+frame. This stage builds the list and a command that returns it; stage 3 uses it for the render
+bar and shows it in the app.
 
 ## The function
 
@@ -27,7 +28,9 @@ It decodes nothing. It asks the planner's own questions, so it cannot disagree w
 about *kind*: `gpu_chain`, `adjustment_ops`, `whole_frame_on_cpu` / `layered_at`,
 `nest_is_plain`, `simple_transition`, and `FxOp::eval(..).filter(FxOp::gpu_ok)` per effect to
 name the culprit. Make those `pub(crate)` where needed; do not write a second copy of their
-rules. Each clip is sampled at its first tick, its middle and its last tick (a keyframed value
+rules. It must stay cheap, because stage 3 calls the same question from the render bar on the
+interface thread: no rasterising and no table building (see stage 3, "The question must be
+cheap"). Each clip is sampled at its first tick, its middle and its last tick (a keyframed value
 that leaves the supported range only between samples is missed; say so in the module comment).
 
 Reasons to produce, in this fork's terms (the exporter's list differs, its coverage differs):

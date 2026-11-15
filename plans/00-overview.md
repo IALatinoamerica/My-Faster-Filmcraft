@@ -30,7 +30,7 @@ copied: each stage is written for this fork's code.
 |---|---|---|
 | [01](01-masked-effects.md) | Effects limited by a mask of their own, on media clips and on adjustment layers | A mask on Color Grading (or any GPU effect) no longer slows playback |
 | [02](02-cpu-report.md) | The report: a function in `crates/render` and a command | An agent can ask "what renders on the CPU in this sequence?" and get a list |
-| [03](03-cpu-report-window.md) | The report in the interface | Bruno sees the list in the app and jumps to each clip |
+| [03](03-render-bar-and-report-window.md) | The render bar asks the planner; the report in the interface | The red / yellow bar above the timeline tells the truth about this fork, says why a stretch is red, and Bruno can open the list and jump to each clip |
 
 Stage 1 goes first so that the report is written once, against the final coverage.
 
