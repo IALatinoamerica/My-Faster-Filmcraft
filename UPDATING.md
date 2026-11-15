@@ -60,8 +60,9 @@ instead, with that button greyed out (see the table below). The update is done h
 ## What must survive: our optimizations
 
 List our commits at any time with `git log --oneline --no-merges upstream/release..main`
-(commits on `main` that are in no upstream release). The designs are described in `plans/`, and
-the measured results in `plans/results.md`. In short:
+(commits on `main` that are in no upstream release). The measured results are in
+`plans/results.md`; `plans/` holds the plans of work not done yet (the plans of finished rounds
+are in the Git history). In short:
 
 | Optimization | What it does | Where it lives |
 |---|---|---|
