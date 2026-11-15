@@ -783,22 +783,13 @@ fn hostile_adjustment_layer_placement_plans_without_panicking() {
     }
 }
 
-/// Color Grading with every section in use (an Input LUT and a Look LUT, wheels, curves, HSL
-/// Secondary, Sharpen) on an adjustment layer is a step for the GPU, and the step renders what
-/// the CPU renderer renders.
-#[test]
-fn a_full_color_grading_adjustment_layer_plans_for_the_gpu() {
-    use crate::gpufx::FxOp;
-    use crate::plan::{DeviceCaps, FramePlan, PlanStep, execute_cpu, is_cpu_frame, plan_frame};
+/// Sets every section of the Color Grading on `c` in use: an Input LUT and a Look LUT, wheels,
+/// curves, HSL Secondary and Sharpen.
+fn grade_everything(s: &mut Scene, c: ClipId) {
     let builtin = |look: bool| {
         let b = crate::luts::builtins().iter().find(|b| b.id.starts_with("look-") == look).expect("a built-in LUT");
         ParamValue::Text(format!("builtin:{}", b.id))
     };
-    let mut s = scene(2);
-    let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
-    place(&mut s.p, s.seq, 0, ocean);
-    let adj = adjustment(&mut s.p, s.seq, 1);
-    fx(&mut s, adj, "lumetri");
     for (id, v) in [
         ("input_lut", builtin(false)),
         ("look_lut", builtin(true)),
@@ -814,8 +805,23 @@ fn a_full_color_grading_adjustment_layer_plans_for_the_gpu() {
         ("hsl_denoise", ParamValue::Float(20.0)),
         ("sharpen", ParamValue::Float(40.0)),
     ] {
-        set(&mut s, adj, "lumetri", id, v);
+        set(s, c, "lumetri", id, v);
     }
+}
+
+/// Color Grading with every section in use (an Input LUT and a Look LUT, wheels, curves, HSL
+/// Secondary, Sharpen) on an adjustment layer is a step for the GPU, and the step renders what
+/// the CPU renderer renders.
+#[test]
+fn a_full_color_grading_adjustment_layer_plans_for_the_gpu() {
+    use crate::gpufx::FxOp;
+    use crate::plan::{DeviceCaps, FramePlan, PlanStep, execute_cpu, is_cpu_frame, plan_frame};
+    let mut s = scene(2);
+    let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
+    place(&mut s.p, s.seq, 0, ocean);
+    let adj = adjustment(&mut s.p, s.seq, 1);
+    fx(&mut s, adj, "lumetri");
+    grade_everything(&mut s, adj);
     for scale in [1.0, 0.5] {
         let opts = RenderOptions { scale, ..Default::default() };
         let t = R.tick_of(12);
@@ -827,5 +833,191 @@ fn a_full_color_grading_adjustment_layer_plans_for_the_gpu() {
         assert_eq!(passes.len(), 5, "Input LUT, Basic, Look / wheels / curves, HSL Secondary, Sharpen");
         let diff = max_diff(&execute_cpu(&plan), &render_sequence(&s.p, s.seq, t, opts, &s.map));
         assert!(diff < 1e-4, "at {scale}: max diff {diff}");
+    }
+}
+
+/// Whether an op, or one inside it, is an effect limited by masks of its own.
+fn has_masked(op: &crate::gpufx::FxOp) -> bool {
+    match op {
+        crate::gpufx::FxOp::Masked { .. } => true,
+        crate::gpufx::FxOp::Seq(ops) => ops.iter().any(has_masked),
+        _ => false,
+    }
+}
+
+/// The ops the plan of a frame hands to the effect stage: of its adjustment steps and of its
+/// layers. None: the frame was planned as one CPU image.
+fn planned_ops(plan: &crate::plan::FramePlan) -> Option<Vec<crate::gpufx::FxOp>> {
+    use crate::plan::{FramePlan, PlanLayer, PlanStep};
+    let of = |layers: &[PlanLayer]| layers.iter().filter_map(|l| l.fx.as_ref()).flat_map(|f| f.ops.clone()).collect::<Vec<_>>();
+    match plan {
+        FramePlan::Image(_) => None,
+        FramePlan::Layers { layers, .. } => Some(of(layers)),
+        FramePlan::Composite { steps, .. } => Some(
+            steps
+                .iter()
+                .flat_map(|st| match st {
+                    PlanStep::Layers(layers) => of(layers),
+                    PlanStep::Adjust { ops } => ops.clone(),
+                    PlanStep::Transition { .. } => Vec::new(),
+                })
+                .collect(),
+        ),
+    }
+}
+
+/// An effect limited by masks of its own, on a media clip or on an adjustment layer, is planned
+/// for the GPU as the effect's op wrapped in `FxOp::Masked`, and the plan draws what the CPU
+/// renderer draws (`mask::apply_effect`). Such an effect used to send the clip's layer, or the
+/// whole frame under an adjustment layer, to the CPU.
+#[test]
+fn an_effect_limited_by_its_own_masks_plans_for_the_gpu() {
+    use crate::plan::{DeviceCaps, execute_cpu, is_cpu_frame, plan_frame};
+    use filmcraft_geom::Vec2;
+    use filmcraft_project::MaskMode;
+    // shapes are given for a 320×180 picture and stretched to the clip's own size (`k`)
+    let rect = |k: Vec2, x0: f64, y0: f64, x1: f64, y1: f64| MaskPath::rect(x0 * k.x, y0 * k.y, x1 * k.x, y1 * k.y);
+    let soft = move |k: Vec2| {
+        let mut m = Mask::new("m", MaskPath::ellipse(Vec2::new(150.0 * k.x, 90.0 * k.y), Vec2::new(90.0 * k.x, 50.0 * k.y)));
+        m.feather.value = ParamValue::Float(14.0 * k.x);
+        m
+    };
+    type Masks = Box<dyn Fn(Vec2) -> Vec<Mask>>;
+    let shapes: Vec<(&str, Masks)> = vec![
+        ("a feathered ellipse", Box::new(move |k| vec![soft(k)])),
+        (
+            "an inverted mask",
+            Box::new(move |k| {
+                let mut m = soft(k);
+                m.inverted = true;
+                vec![m]
+            }),
+        ),
+        (
+            "two masks",
+            Box::new(move |k| {
+                let mut cut = Mask::new("cut", rect(k, 120.0, 60.0, 200.0, 120.0));
+                cut.mode = MaskMode::Subtract;
+                vec![soft(k), cut]
+            }),
+        ),
+        (
+            "a keyframed mask",
+            Box::new(move |k| {
+                let mut m = Mask::new("k", rect(k, 20.0, 20.0, 120.0, 100.0));
+                m.path.put_keyframe(Tick::ZERO, ParamValue::Path(rect(k, 20.0, 20.0, 120.0, 100.0)));
+                m.path.put_keyframe(R.tick_of(24), ParamValue::Path(rect(k, 180.0, 70.0, 300.0, 170.0)));
+                vec![m]
+            }),
+        ),
+    ];
+    // (the masked effect, its settings, an unmasked effect after it)
+    type Chain = (&'static str, Vec<(&'static str, ParamValue)>, Option<&'static str>);
+    let chains: Vec<Chain> = vec![
+        ("gaussian_blur", vec![("blurriness", ParamValue::Float(40.0))], Some("invert")),
+        ("invert", vec![], None),
+        ("unsharp_mask", vec![("amount", ParamValue::Float(180.0)), ("radius", ParamValue::Float(3.0))], None),
+        ("drop_shadow", vec![("distance", ParamValue::Float(12.0)), ("softness", ParamValue::Float(6.0)), ("only", ParamValue::Bool(true))], None),
+        ("transform", vec![("scale_height", ParamValue::Float(140.0))], Some("tint")),
+        ("lumetri", vec![], None),
+    ];
+    // (where the effect sits, with the layer nudged or the clip's opacity masked)
+    for (target, extra) in [("adjustment", false), ("adjustment", true), ("clip", false), ("clip", true)] {
+        for (effect, params, then) in &chains {
+            for (shape, masks) in &shapes {
+                let what = format!("{effect} with {shape} on the {target} ({extra})");
+                let build = |masked: bool, on: bool| {
+                    let mut s = scene(2);
+                    let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
+                    let below = place(&mut s.p, s.seq, 0, ocean);
+                    let c = if target == "adjustment" { adjustment(&mut s.p, s.seq, 1) } else { below };
+                    let size = if target == "adjustment" { (320, 180) } else { crate::source_size(&s.p, ocean).expect("a size") };
+                    let k = Vec2::new(size.0 as f64 / 320.0, size.1 as f64 / 180.0);
+                    if on {
+                        if let Some(then) = then {
+                            fx(&mut s, c, then);
+                        }
+                        fx(&mut s, c, effect);
+                        if *effect == "lumetri" {
+                            grade_everything(&mut s, c);
+                        }
+                        for (id, v) in params {
+                            set(&mut s, c, effect, id, v.clone());
+                        }
+                        if masked {
+                            clip(&mut s, c).effect_mut(effect).unwrap().masks = masks(k);
+                        }
+                    }
+                    if extra && target == "adjustment" {
+                        set(&mut s, c, "motion", "position", ParamValue::Vec2(Vec2::new(170.0, 96.0)));
+                    } else if extra {
+                        clip(&mut s, c).effect_mut("opacity").unwrap().masks.push(Mask::new("o", rect(k, 40.0, 10.0, 290.0, 160.0)));
+                    }
+                    s
+                };
+                let s = build(true, true);
+                for scale in [1.0, 0.5] {
+                    let opts = RenderOptions { scale, ..Default::default() };
+                    let t = R.tick_of(12);
+                    assert!(!is_cpu_frame(&s.p, s.seq, t, opts, DeviceCaps::ALL), "{what} at {scale}");
+                    let plan = plan_frame(&s.p, s.seq, t, opts, DeviceCaps::ALL, &s.map);
+                    let ops = planned_ops(&plan).unwrap_or_else(|| panic!("{what} at {scale}: planned as one CPU image"));
+                    assert!(ops.iter().any(has_masked), "{what} at {scale}: no masked op in {} ops", ops.len());
+                    assert!(ops.iter().all(crate::gpufx::FxOp::gpu_ok), "{what} at {scale}");
+                    let reference = render_sequence(&s.p, s.seq, t, opts, &s.map);
+                    let diff = max_diff(&execute_cpu(&plan), &reference);
+                    assert!(diff < 1e-4, "{what} at {scale}: max diff {diff}");
+                    // the masks limit the effect: neither the whole effect nor none of it
+                    let (whole, none) = (build(false, true), build(false, false));
+                    let whole = render_sequence(&whole.p, whole.seq, t, opts, &whole.map);
+                    let none = render_sequence(&none.p, none.seq, t, opts, &none.map);
+                    // (Unsharp Mask leaves this smooth clip as it is; on the adjustment layer it does not)
+                    if !(*effect == "unsharp_mask" && target == "clip") {
+                        assert!(max_diff(&reference, &whole) > 0.02, "{what} at {scale}: the masks limit nothing");
+                        assert!(max_diff(&reference, &none) > 0.02, "{what} at {scale}: the effect did nothing");
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Masks that are switched off do not wrap the effect, and hostile mask values plan and render
+/// without panicking.
+#[test]
+fn switched_off_and_hostile_effect_masks_plan_without_panicking() {
+    use crate::plan::{DeviceCaps, execute_cpu, plan_frame};
+    use filmcraft_project::MaskMode;
+    let build = |mask: Mask| {
+        let mut s = scene(2);
+        let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
+        let below = place(&mut s.p, s.seq, 0, ocean);
+        let adj = adjustment(&mut s.p, s.seq, 1);
+        for c in [below, adj] {
+            fx(&mut s, c, "invert");
+            clip(&mut s, c).effect_mut("invert").unwrap().masks.push(mask.clone());
+        }
+        s
+    };
+    let mut off = Mask::new("off", MaskPath::rect(10.0, 10.0, 100.0, 100.0));
+    off.mode = MaskMode::None;
+    let s = build(off);
+    let plan = plan_frame(&s.p, s.seq, R.tick_of(12), RenderOptions::default(), DeviceCaps::ALL, &s.map);
+    let ops = planned_ops(&plan).expect("planned for the GPU");
+    assert!(!ops.is_empty() && !ops.iter().any(has_masked), "a mask that is off limits nothing");
+    for v in [f64::NAN, f64::INFINITY, -1e30, 1e30, 0.0] {
+        for field in ["path", "feather", "expansion", "opacity"] {
+            let mut m = Mask::new("h", MaskPath::rect(10.0, 10.0, 100.0, 100.0));
+            match field {
+                "path" => m.path.value = ParamValue::Path(MaskPath::rect(v, 10.0, 100.0, v)),
+                "feather" => m.feather.value = ParamValue::Float(v),
+                "expansion" => m.expansion.value = ParamValue::Float(v),
+                _ => m.opacity.value = ParamValue::Float(v),
+            }
+            let s = build(m);
+            let plan = plan_frame(&s.p, s.seq, R.tick_of(12), RenderOptions::default(), DeviceCaps::ALL, &s.map);
+            let img = execute_cpu(&plan);
+            assert_eq!((img.w, img.h), (320, 180), "{field} = {v}");
+        }
     }
 }

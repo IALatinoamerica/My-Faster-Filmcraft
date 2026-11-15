@@ -244,6 +244,14 @@ pub enum FxOp {
         weight: f32,
         cov: Option<std::sync::Arc<Vec<f32>>>,
     },
+    /// An effect limited by masks of its own (`mask::apply_effect`): `op` runs, and its result
+    /// is kept only where `cov` (the masks' coverage of the working image, row by row) says:
+    /// `before + (result − before) × cov`. A plane of another size leaves the image as it is.
+    /// `op` is the effect's op, never another `Masked` or a [`FxOp::MixBase`].
+    Masked {
+        op: Box<FxOp>,
+        cov: std::sync::Arc<Vec<f32>>,
+    },
     /// Transform with its own shutter angle: the mean of the working image placed by each of
     /// `samples` (the motion while the shutter is open).
     ResampleBlur {
@@ -814,6 +822,7 @@ impl FxOp {
             }
             FxOp::Mask { .. } => true,
             FxOp::MixBase { weight, .. } => weight.is_finite(),
+            FxOp::Masked { op, .. } => op.gpu_ok() && !op.mixes(),
             FxOp::LumaKey(k) => k.gpu_ok(),
             FxOp::RoundedCrop(c) => c.gpu_ok(),
             FxOp::DropShadow(d) => d.gpu_ok(),
@@ -826,6 +835,16 @@ impl FxOp {
             FxOp::GradeLut(l) => l.gpu_ok(),
             FxOp::GradeHsl(k) => k.gpu_ok(),
             FxOp::DigitalGlitch(g) => g.gpu_ok(),
+        }
+    }
+
+    /// Whether the op, or one inside it, mixes with a picture kept from before it
+    /// ([`FxOp::Masked`], [`FxOp::MixBase`]): such an op cannot be the inside of a `Masked`.
+    fn mixes(&self) -> bool {
+        match self {
+            FxOp::Masked { .. } | FxOp::MixBase { .. } => true,
+            FxOp::Seq(ops) => ops.iter().any(FxOp::mixes),
+            _ => false,
         }
     }
 
@@ -1161,6 +1180,13 @@ impl FxOp {
             }
             // (needs the base: `mix_base`)
             FxOp::MixBase { .. } => {}
+            FxOp::Masked { op, cov } => {
+                if cov.len().checked_mul(4) == Some(img.px.len()) {
+                    let before = img.clone();
+                    op.apply(img);
+                    crate::mask::mix(img, &before, cov);
+                }
+            }
             FxOp::AlphaAdjust { opacity, ignore, invert, mask_only } => {
                 let (op, ignore, invert, mask_only) = (*opacity, *ignore, *invert, *mask_only);
                 img.px.par_chunks_mut(4).for_each(|p| {

@@ -1378,3 +1378,74 @@ fn gpu_color_grading_hsl_secondary_and_sharpen_match_cpu() {
     chains.push((vec![blur.clone(), effect("lumetri", &everything), blur], 2e-5));
     check_chains(96, 54, Tick::ZERO, &chains);
 }
+
+/// Effects limited by masks of their own (`FxOp::Masked`): the effect's passes, then the mix of
+/// the picture from before it with their result by the masks' coverage. Also after effects that
+/// keep an original of their own (Unsharp Mask, Drop Shadow, a shutter Transform), for a whole
+/// Color Grading, two in a row, with an opacity mask, and on an adjustment layer that keeps part
+/// of the picture below (`FxOp::MixBase`); a plane of another size is a no-op on both paths.
+#[test]
+fn gpu_effects_limited_by_their_own_masks_match_cpu() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (67u32, 41u32);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let plane = |f: &dyn Fn(u32, u32) -> f32| std::sync::Arc::new((0..w * h).map(|i| f(i % w, i / w).clamp(0.0, 1.0)).collect::<Vec<f32>>());
+    let good = plane(&|x, y| if y < 10 { 0.0 } else { x as f32 / (w - 1) as f32 * 1.5 - 0.25 });
+    let other = plane(&|x, y| 1.0 - ((x as f32 - 30.0).powi(2) + (y as f32 - 20.0).powi(2)).sqrt() / 18.0);
+    let odd = std::sync::Arc::new(vec![0.5f32; 7]);
+    let at = cx(Tick::from_seconds_f64(0.5), 1.0);
+    let eval = |e: &filmcraft_project::EffectInstance| FxOp::eval(e, &at, w as usize, h as usize).expect("op");
+    let blur = eval(&effect("gaussian_blur", &[("blurriness", fl(6.0))]));
+    let invert = eval(&effect("invert", &[]));
+    let unsharp = eval(&effect("unsharp_mask", &[("amount", fl(150.0)), ("radius", fl(3.0))]));
+    let shadow = eval(&effect("drop_shadow", &[("distance", fl(6.0)), ("softness", fl(4.0)), ("only", ParamValue::Bool(true))]));
+    let mut zoom = effect("transform", &[("shutter_override", ParamValue::Bool(true)), ("shutter_angle", fl(360.0))]);
+    let p = zoom.params.get_mut("scale_height").expect("scale");
+    p.put_keyframe(Tick::ZERO, fl(100.0));
+    p.put_keyframe(Tick::from_seconds_f64(1.0), fl(190.0));
+    let zoom = eval(&zoom);
+    let [wheels, rgb, hue] = grade_parts();
+    let mut everything = vec![("contrast", fl(25.0)), ("hsl_on", ParamValue::Bool(true)), ("hsl_hue", fl(120.0)), ("hsl_blur", fl(8.0)), ("sharpen", fl(50.0))];
+    everything.extend(wheels);
+    everything.extend(rgb);
+    everything.extend(hue);
+    let grade = eval(&effect("lumetri", &everything));
+    assert!(matches!(grade, FxOp::Seq(_)), "a grade of several passes");
+    let m = |op: &FxOp, cov: &std::sync::Arc<Vec<f32>>| FxOp::Masked { op: Box::new(op.clone()), cov: cov.clone() };
+    let chains = [
+        ("a blur", vec![m(&blur, &good)], EXACT * 2.0),
+        ("a colour effect, then an unmasked blur", vec![m(&invert, &good), blur.clone()], EXACT * 2.0),
+        ("Unsharp Mask", vec![m(&unsharp, &good)], EXACT * 2.0),
+        ("Drop Shadow", vec![m(&shadow, &good)], EXACT * 2.0),
+        ("a shutter Transform", vec![m(&zoom, &good)], EXACT * 2.0),
+        ("a whole Color Grading", vec![m(&grade, &good)], EXACT * 2.0),
+        ("two masked effects", vec![m(&blur, &good), m(&unsharp, &other)], EXACT * 2.0),
+        ("a masked effect and an opacity mask", vec![m(&blur, &good), FxOp::Mask { cov: other.clone() }], EXACT * 2.0),
+        (
+            "masked effects on a layer that keeps the picture below",
+            vec![m(&unsharp, &good), blur.clone(), m(&invert, &other), FxOp::MixBase { weight: 0.8, cov: Some(other.clone()) }],
+            EXACT * 2.0,
+        ),
+        ("a plane of another size", vec![m(&blur, &odd), invert.clone()], EXACT * 2.0),
+    ];
+    for (what, ops, tol) in chains {
+        assert!(ops.iter().all(FxOp::gpu_ok), "{what}");
+        let cpu = apply_with_base(&ops, &px, w, h);
+        let changed = cpu.px.iter().zip(&px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        assert!(changed > 0.01, "{what}: the ops change nothing");
+        for _ in 0..2 {
+            let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, turns: 0, ops: ops.clone() }).expect("effect image");
+            let (worst, _) = compare(&cpu.px, &gpu);
+            assert!(worst < tol, "{what}: worst difference {worst}");
+        }
+    }
+    // an effect that itself mixes with a kept picture cannot be the inside of a masked effect
+    assert!(!m(&m(&blur, &good), &good).gpu_ok());
+    assert!(!m(&FxOp::MixBase { weight: 1.0, cov: None }, &good).gpu_ok());
+    assert!(!m(&FxOp::Seq(vec![blur.clone(), m(&invert, &good)]), &good).gpu_ok());
+}

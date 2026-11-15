@@ -147,6 +147,11 @@ struct Step {
     /// A table of numbers read through the table binding: (values, width, height), one `R32Float`
     /// texel each, row by row (a coverage plane, curves, a LUT).
     table: Option<(std::sync::Arc<Vec<f32>>, u32, u32)>,
+    /// The first pass of an effect limited by masks of its own ([`FxOp::Masked`]): the picture it
+    /// reads is set aside, untouched, until the effect's `mask_mix`.
+    mask_begin: bool,
+    /// The last pass of such an effect: reads, as the aux texture, the picture set aside.
+    mask_mix: bool,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -154,7 +159,21 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), plane: None, reads_orig: false, mix_base: false, table: None }
+    Step {
+        run: false,
+        code,
+        i1,
+        p: q,
+        combine: false,
+        unsharp_blur: false,
+        kernel: Vec::new(),
+        plane: None,
+        reads_orig: false,
+        mix_base: false,
+        table: None,
+        mask_begin: false,
+        mask_mix: false,
+    }
 }
 
 /// The pass of a Color Grading LUT: the LUT on the display-encoded colour, mixed in by `mix`;
@@ -236,6 +255,23 @@ fn boxes(radii: &[u32], vertical: bool, repeat: bool, out: &mut Vec<Step>) {
         s.run = r > BOX_PER_PIXEL_MAX;
         out.push(s);
     }
+}
+
+/// The passes of an effect limited by masks of its own ([`FxOp::Masked`]): the effect's, the
+/// first marked to set its picture aside, then `mask::mix` of that picture with the result by
+/// the masks' coverage. Nothing for a plane of another size (a no-op, as on the CPU), for an
+/// effect without passes, or for one that itself mixes with a kept picture.
+fn masked_steps(op: &FxOp, cov: &std::sync::Arc<Vec<f32>>, w: u32, h: u32) -> Vec<Step> {
+    let mut out = steps(op, w, h);
+    let plain = out.iter().all(|s| !(s.mask_begin || s.mask_mix || s.mix_base));
+    let fits = (w as usize).checked_mul(h as usize) == Some(cov.len());
+    let Some(first) = out.first_mut().filter(|_| plain && fits) else { return Vec::new() };
+    first.mask_begin = true;
+    let mut s = step(OP_MIX_BASE, [1, 0, 0, 0], &[1.0]);
+    s.mask_mix = true;
+    s.table = Some((cov.clone(), w, h));
+    out.push(s);
+    out
 }
 
 /// The passes of an op on a `w`×`h` working image (empty: no-op). Unsharp's blur passes come
@@ -567,6 +603,7 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
                 out.push(s);
             }
         }
+        FxOp::Masked { op, cov } => out.extend(masked_steps(op, cov, w, h)),
         FxOp::Mask { cov } => {
             // a plane of another size is a no-op, as on the CPU
             if (w as usize).checked_mul(h as usize) == Some(cov.len()) {
@@ -771,25 +808,31 @@ impl FxStage {
         let all: Vec<Step> = fx.ops.iter().flat_map(|op| steps(op, w, h)).collect();
         // the picture the job starts from, when a step mixes with it at the end: never written to
         let base = all.iter().any(|s| s.mix_base).then_some(0usize);
-        let n = 2 + all.iter().any(|s| s.combine) as usize + base.is_some() as usize;
+        let n = 2 + all.iter().any(|s| s.combine) as usize + base.is_some() as usize + all.iter().any(|s| s.mask_mix) as usize;
         let targets = self.targets(device, (w, h), n);
         let views: Vec<wgpu::TextureView> = targets.iter().map(|t| t.1.clone()).collect();
         let mut dispatches = Vec::with_capacity(all.len());
         let mut cur = 0usize;
         // Unsharp: the image its blur started from (kept while its blur passes run)
         let mut orig: Option<usize> = None;
+        // a masked effect: the picture from before it (kept while its passes run)
+        let mut kept: Option<usize> = None;
         for s in &all {
+            if s.mask_begin {
+                kept = Some(cur);
+            }
             // (an Unsharp without blur passes, radius 0, combines the original with itself)
             if (s.unsharp_blur || s.combine || s.reads_orig) && orig.is_none() {
                 orig = Some(cur);
             }
             let keep = if s.unsharp_blur || s.combine || s.reads_orig { orig } else { None };
-            let dst = (0..n).find(|k| *k != cur && Some(*k) != keep && Some(*k) != base)?;
+            let dst = (0..n).find(|k| *k != cur && Some(*k) != keep && Some(*k) != base && Some(*k) != kept)?;
             let kernel = match &s.plane {
                 Some(cov) => Some(self.plane_texture(device, queue, cov, w, h)),
                 None => (!s.kernel.is_empty()).then(|| kernel_texture(device, queue, &s.kernel)),
             };
             let aux = match (s.mix_base, base, s.combine || s.reads_orig, orig, &kernel) {
+                _ if s.mask_mix => views.get(kept?)?,
                 (true, Some(b), ..) => views.get(b)?,
                 (_, _, true, Some(o), _) => views.get(o)?,
                 (.., Some(k)) => k,
@@ -840,6 +883,9 @@ impl FxStage {
             cur = dst;
             if s.combine {
                 orig = None;
+            }
+            if s.mask_mix {
+                kept = None;
             }
         }
         Some(FxJob {

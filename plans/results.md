@@ -66,3 +66,27 @@ and `filmcraft-ui-egui`; the tests of `filmcraft-render` and `filmcraft-gpu` and
 of `filmcraft-ui-egui`, all passing. Not run: `cargo xtask ci` (the whole workspace and the web
 build). The audio was not measured: its crackling was explained from the code as a consequence of
 the CPU being saturated, which no longer happens in this project.
+
+## Round 3, stage 1: effects limited by a mask of their own
+
+Two more copies of the project: `FX Color Grading Masked CAM.fcproj` and
+`FX Color Grading Masked ADJ.fcproj`, the projects above with a feathered elliptical mask on each
+Color Grading (247 camera clips, 16 zoom layers). Frames shown of 600 in a 10 s window, Full
+resolution, 2026-11-15. FilmCraft was open during the "before" runs and closed for the "after"
+runs.
+
+| Project | Window (start) | Before | After | Unmasked project, same run |
+|---|---|---|---|---|
+| Masked CAM | 30 s | 0 | 578 | 584 |
+| Masked CAM | 140 s | 0 | 562 | 554 |
+| Masked ADJ | 30 s (no graded layer in the window) | 574 | 575 | 583 |
+| Masked ADJ | 140 s | 0 | 555 | 558 |
+
+Before, a masked effect sent the clip's layer (CAM) or the whole frame (ADJ) to the CPU: 235 and
+208 ms of CPU per frame due. After, the GPU pass costs the same as without the mask (p50 12.3 ms
+masked against 12.6 ms unmasked on CAM at 30 s).
+
+Checks run: `cargo fmt`; clippy with warnings as errors on `filmcraft-render`, `filmcraft-gpu` and
+`filmcraft-ui-egui`; tests of `filmcraft-render` (286 pass), `filmcraft-gpu` (64 pass, 4 ignored)
+and `filmcraft-ui-egui --lib` (358 pass). No upstream test asserted the old behaviour, so none
+was changed. Not run: `cargo xtask ci`; no visual check in the app.

@@ -101,8 +101,9 @@ pub enum PlanStep {
         scale: f32,
     },
     /// An adjustment layer: `ops` run on the whole canvas of the tracks below, and the result
-    /// replaces it (full frame, opacity 100 %, Normal, no masks: anything else plans the frame on
-    /// the CPU).
+    /// replaces it; a layer that keeps part of the picture below ends in [`FxOp::MixBase`], and an
+    /// effect limited by masks of its own is a [`FxOp::Masked`]. A blend mode other than Normal
+    /// plans the frame on the CPU.
     Adjust {
         ops: Vec<FxOp>,
     },
@@ -249,9 +250,9 @@ fn simple_transition(id: &str) -> bool {
 }
 
 /// The standard effects of a media clip if the GPU can draw it (any blend mode, every enabled
-/// standard effect unmasked and with a GPU implementation; empty without effects or with effects
-/// off). None: the clip is rendered on the CPU. Opacity masks are the last op of the effect stage
-/// ([`opacity_mask_op`]).
+/// standard effect with a GPU implementation; empty without effects or with effects off). None:
+/// the clip is rendered on the CPU. An effect's own masks wrap its op ([`masked_op`]); opacity
+/// masks are the last op of the effect stage ([`opacity_mask_op`]).
 fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
     let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
     if !is_media {
@@ -265,8 +266,7 @@ fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) ->
         if !e.enabled {
             continue;
         }
-        let masked = e.masks.iter().any(|m| m.mode != filmcraft_project::MaskMode::None);
-        if masked || !crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) {
+        if !crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str()) {
             return None;
         }
         chain.push(e);
@@ -286,14 +286,19 @@ const MAX_MASK_PLANES: usize = 16;
 /// `mask::apply_opacity_masks` applies it. None: no mask to apply.
 fn opacity_mask_op(item: &TrackItem, mt: Tick, px_scale: f32, w: usize, h: usize) -> Option<FxOp> {
     let op = item.effect("opacity").filter(|e| e.enabled && !e.masks.is_empty())?;
-    let flat = crate::mask::prepare(&op.masks, mt, px_scale);
+    Some(FxOp::Mask { cov: mask_plane(crate::mask::prepare(&op.masks, mt, px_scale), w, h)? })
+}
+
+/// The coverage of flattened masks on a `w`×`h` working image, from [`MASK_PLANES`] when the same
+/// masks were rasterised for that size before. None: no mask that limits anything.
+fn mask_plane(flat: Vec<crate::mask::FlatMask>, w: usize, h: usize) -> Option<Arc<Vec<f32>>> {
     {
         let mut planes = MASK_PLANES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(i) = planes.iter().position(|(f, size, _)| *size == (w, h) && *f == flat) {
             let hit = planes.remove(i);
             let cov = hit.2.clone();
             planes.push(hit);
-            return Some(FxOp::Mask { cov });
+            return Some(cov);
         }
     }
     // rasterised without the lock: other frames' jobs plan meanwhile
@@ -303,7 +308,25 @@ fn opacity_mask_op(item: &TrackItem, mt: Tick, px_scale: f32, w: usize, h: usize
         planes.remove(0);
     }
     planes.push((flat, (w, h), cov.clone()));
-    Some(FxOp::Mask { cov })
+    Some(cov)
+}
+
+/// Whether an effect is limited by masks of its own.
+fn has_masks(e: &filmcraft_project::EffectInstance) -> bool {
+    e.masks.iter().any(|m| m.mode != filmcraft_project::MaskMode::None)
+}
+
+/// `op`, the op of effect `e` on a `w`×`h` working image, limited by the effect's own masks as
+/// `mask::apply_effect` limits it (their coverage at `cx.t` and `cx.mask_scale`); `op` itself
+/// for an effect without masks.
+fn masked_op(e: &filmcraft_project::EffectInstance, op: FxOp, cx: &crate::effects::FxCtx, w: usize, h: usize) -> FxOp {
+    if !has_masks(e) {
+        return op;
+    }
+    match mask_plane(crate::mask::prepare(&e.masks, cx.t, cx.mask_scale), w, h) {
+        Some(cov) => FxOp::Masked { op: Box::new(op), cov },
+        None => op,
+    }
 }
 
 /// Plan the frame at timeline `t` for a device that runs `caps`.
@@ -410,8 +433,8 @@ fn is_adjustment(project: &Project, it: &TrackItem) -> bool {
 }
 
 /// The ops of an adjustment layer that can be a [`PlanStep::Adjust`] at `t` and render `scale` on
-/// a device that runs `caps`: the device adjusts a frame of this size, and the layer is opaque,
-/// Normal, unmasked, covering the whole frame, with every enabled standard effect unmasked and
+/// a device that runs `caps`: the device adjusts a frame of this size, and the layer blends
+/// Normal, with every enabled standard effect
 /// evaluating to an op the GPU runs (at the frame's size, as `adjustment_layer` applies them on the
 /// CPU). None sends the frame to the CPU. [`layered_at`] and [`push_adjustment`] both ask this, so
 /// [`is_cpu_frame`] knows which frames plan as one CPU image.
@@ -439,8 +462,8 @@ fn adjustment_ops(project: &Project, seq: &Sequence, it: &TrackItem, t: Tick, sc
         .iter()
         .filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic))
         .map(|e| {
-            let gpu = e.masks.iter().all(|m| m.mode == filmcraft_project::MaskMode::None) && crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str());
-            if gpu { FxOp::eval(e, &cx, w, h).filter(FxOp::gpu_ok) } else { None }
+            let gpu = crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str());
+            if gpu { FxOp::eval(e, &cx, w, h).filter(FxOp::gpu_ok).map(|op| masked_op(e, op, &cx, w, h)) } else { None }
         })
         .collect::<Option<_>>()?;
     // a layer that is not opaque, is masked or does not cover the frame keeps part of the picture
@@ -755,7 +778,8 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
                 frame_rate: seq.settings.frame_rate.as_f64(),
                 working: seq.settings.color.working,
             };
-            let ops: Option<Vec<FxOp>> = chain.iter().map(|e| FxOp::eval(e, &cx, lw, lh).filter(FxOp::gpu_ok)).collect();
+            let ops: Option<Vec<FxOp>> =
+                chain.iter().map(|e| FxOp::eval(e, &cx, lw, lh).filter(FxOp::gpu_ok).map(|op| masked_op(e, op, &cx, lw, lh))).collect();
             if let Some(mut ops) = ops {
                 if masked {
                     ops.extend(opacity_mask_op(item, mt, px_scale, lw, lh));
