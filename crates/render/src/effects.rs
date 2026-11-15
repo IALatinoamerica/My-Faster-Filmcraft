@@ -761,7 +761,7 @@ fn lumetri(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
 // ---------- blur kernels ----------
 
 /// Box radii for an n-pass box blur approximating a Gaussian of sigma (Kovesi / Wells).
-fn boxes_for_gauss(sigma: f32, n: usize) -> Vec<usize> {
+pub(crate) fn boxes_for_gauss(sigma: f32, n: usize) -> Vec<usize> {
     let wideal = ((12.0 * sigma * sigma / n as f32) + 1.0).sqrt();
     let mut wl = wideal.floor() as i32;
     if wl % 2 == 0 {
@@ -1536,7 +1536,7 @@ fn hsl_secondary(img: &mut Image, e: &EffectInstance, cx: &FxCtx) {
 
 /// Median of the `(2r+1)²` neighbourhood of every sample of a single-channel plane (edges
 /// clamped).
-fn median_filter(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
+pub(crate) fn median_filter(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
     let mut out = vec![0f32; src.len()];
     out.par_chunks_mut(w).enumerate().for_each(|(y, row)| {
         let mut win: Vec<f32> = Vec::with_capacity((2 * r + 1) * (2 * r + 1));
@@ -1554,7 +1554,7 @@ fn median_filter(src: &[f32], w: usize, h: usize, r: usize) -> Vec<f32> {
 }
 
 /// Gaussian blur of a single-channel plane (three box passes per axis, edges clamped).
-fn blur_plane(p: &mut [f32], w: usize, h: usize, sigma: f32) {
+pub(crate) fn blur_plane(p: &mut [f32], w: usize, h: usize, sigma: f32) {
     let radii = boxes_for_gauss(sigma, 3);
     let pass = |p: &mut [f32], w: usize, h: usize, r: usize| {
         if r == 0 {

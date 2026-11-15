@@ -782,3 +782,50 @@ fn hostile_adjustment_layer_placement_plans_without_panicking() {
         }
     }
 }
+
+/// Color Grading with every section in use (an Input LUT and a Look LUT, wheels, curves, HSL
+/// Secondary, Sharpen) on an adjustment layer is a step for the GPU, and the step renders what
+/// the CPU renderer renders.
+#[test]
+fn a_full_color_grading_adjustment_layer_plans_for_the_gpu() {
+    use crate::gpufx::FxOp;
+    use crate::plan::{DeviceCaps, FramePlan, PlanStep, execute_cpu, is_cpu_frame, plan_frame};
+    let builtin = |look: bool| {
+        let b = crate::luts::builtins().iter().find(|b| b.id.starts_with("look-") == look).expect("a built-in LUT");
+        ParamValue::Text(format!("builtin:{}", b.id))
+    };
+    let mut s = scene(2);
+    let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
+    place(&mut s.p, s.seq, 0, ocean);
+    let adj = adjustment(&mut s.p, s.seq, 1);
+    fx(&mut s, adj, "lumetri");
+    for (id, v) in [
+        ("input_lut", builtin(false)),
+        ("look_lut", builtin(true)),
+        ("contrast", ParamValue::Float(20.0)),
+        ("wheel_midtones_l", ParamValue::Float(25.0)),
+        ("curve_luma", ParamValue::Curve(vec![[0.0, 0.05], [0.5, 0.6], [1.0, 0.95]])),
+        ("hue_vs_sat", ParamValue::Curve(vec![[0.1, 0.8], [0.5, 0.3]])),
+        ("hsl_on", ParamValue::Bool(true)),
+        ("hsl_hue", ParamValue::Float(210.0)),
+        ("hsl_hue_range", ParamValue::Float(90.0)),
+        ("hsl_sat", ParamValue::Float(150.0)),
+        ("hsl_blur", ParamValue::Float(10.0)),
+        ("hsl_denoise", ParamValue::Float(20.0)),
+        ("sharpen", ParamValue::Float(40.0)),
+    ] {
+        set(&mut s, adj, "lumetri", id, v);
+    }
+    for scale in [1.0, 0.5] {
+        let opts = RenderOptions { scale, ..Default::default() };
+        let t = R.tick_of(12);
+        assert!(!is_cpu_frame(&s.p, s.seq, t, opts, DeviceCaps::ALL), "at {scale}");
+        let plan = plan_frame(&s.p, s.seq, t, opts, DeviceCaps::ALL, &s.map);
+        let FramePlan::Composite { steps, .. } = &plan else { panic!("at {scale}: planned as one CPU image") };
+        let ops = steps.iter().find_map(|st| if let PlanStep::Adjust { ops } = st { Some(ops) } else { None }).expect("an adjustment step");
+        let [FxOp::Seq(passes)] = ops.as_slice() else { panic!("at {scale}: {ops:?}") };
+        assert_eq!(passes.len(), 5, "Input LUT, Basic, Look / wheels / curves, HSL Secondary, Sharpen");
+        let diff = max_diff(&execute_cpu(&plan), &render_sequence(&s.p, s.seq, t, opts, &s.map));
+        assert!(diff < 1e-4, "at {scale}: max diff {diff}");
+    }
+}

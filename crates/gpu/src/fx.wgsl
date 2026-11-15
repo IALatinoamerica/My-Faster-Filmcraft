@@ -73,6 +73,9 @@ const OP_EMBOSS: u32 = 112u;
 const OP_GLITCH: u32 = 113u;
 const OP_GRADE_ADV: u32 = 114u;
 const OP_LUT: u32 = 115u;
+const OP_HSL_KEY: u32 = 116u;
+const OP_HSL_MEDIAN: u32 = 117u;
+const OP_HSL_FINAL: u32 = 118u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -771,6 +774,78 @@ fn key_matte(o: vec4<f32>) -> f32 {
     return clamp((clamp(m, 0.0, 1.0) - u.p2.x) / (1.0 - u.p2.x), 0.0, 1.0);
 }
 
+// Color Grading's HSL Secondary (`gpufx_more::GradeHsl`): p0 = (hue, hue range, saturation from,
+// lightness from), p1 = (lightness to, softness, temperature, tint), p2 = (saturation, hue shift,
+// denoise amount); i1 = (mask view, median radius).
+// The key of a premultiplied pixel.
+fn hsl_key(o: vec4<f32>) -> f32 {
+    if o.a <= 1e-6 {
+        return 0.0;
+    }
+    let h = rgb_to_hsl(clamp(enc(o.rgb / o.a), vec3(0.0), vec3(1.0)));
+    let soft = u.p1.y;
+    let d = abs(h.x - u.p0.x);
+    let dh = min(d, 1.0 - d);
+    let mh = 1.0 - clamp((dh - u.p0.y / 2.0) / soft, 0.0, 1.0);
+    let ms = clamp((h.y - u.p0.z) / soft, 0.0, 1.0);
+    let ml = min(clamp((h.z - u.p0.w) / soft, 0.0, 1.0), clamp((u.p1.x - h.z) / soft, 0.0, 1.0));
+    return mh * ms * ml;
+}
+
+// The median of the key around `p`: the window is cut at the picture's edges, and the median of
+// `n` values is the one at `n / 2` in order (`effects::median_filter`).
+fn hsl_median(p: vec2<i32>) -> f32 {
+    let s = size();
+    let r = i32(u.i1.y);
+    var win: array<f32, 49>;
+    var n = 0;
+    for (var y = max(p.y - r, 0); y <= min(p.y + r, s.y - 1); y++) {
+        for (var x = max(p.x - r, 0); x <= min(p.x + r, s.x - 1); x++) {
+            if n < 49 {
+                // kept in order as it is filled
+                let v = ld(vec2(x, y)).r;
+                var i = n;
+                while i > 0 && win[i - 1] > v {
+                    win[i] = win[i - 1];
+                    i--;
+                }
+                win[i] = v;
+                n++;
+            }
+        }
+    }
+    return win[n / 2];
+}
+
+// The corrected (or mask view) colour of a straight linear colour `c` for the key `m`.
+fn hsl_final(c: vec3<f32>, m: f32) -> vec3<f32> {
+    let q = clamp(enc(c), vec3(0.0), vec3(1.0));
+    var out: vec3<f32>;
+    switch u.i1.x {
+        case 1u: {
+            let g = rgb_to_hsl(q).z;
+            out = vec3(g) + (q - vec3(g)) * m;
+        }
+        case 2u: {
+            out = q * m;
+        }
+        case 3u: {
+            out = vec3(m);
+        }
+        default: {
+            var hh = rgb_to_hsl(q);
+            hh.x = fract_euclid(hh.x + u.p2.y);
+            hh.y = clamp(hh.y * u.p2.x, 0.0, 1.0);
+            var c2 = hsl_to_rgb(hh.x, hh.y, hh.z);
+            c2.x = c2.x * (1.0 + 0.25 * u.p1.z);
+            c2.z = c2.z * (1.0 - 0.25 * u.p1.z);
+            c2.y = c2.y * (1.0 - 0.2 * u.p1.w);
+            out = q + (c2 - q) * m;
+        }
+    }
+    return dec(out);
+}
+
 // Value `i` of the pass's table (rows of 1024).
 fn tbl_at(i: i32) -> f32 {
     return textureLoad(tbl, vec2(i % 1024, i / 1024), 0).r;
@@ -1132,6 +1207,22 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             let na = a * o.a;
             return vec4(l * na, na);
+        }
+        case OP_HSL_KEY: {
+            return vec4(hsl_key(textureLoad(aux, p, 0)));
+        }
+        case OP_HSL_MEDIAN: {
+            // src: the key
+            let m = ld(p).r;
+            return vec4(m + (hsl_median(p) - m) * u.p2.z);
+        }
+        case OP_HSL_FINAL: {
+            // src: the key, aux: the picture
+            let o = textureLoad(aux, p, 0);
+            if o.a <= 1e-6 {
+                return o;
+            }
+            return vec4(hsl_final(o.rgb / o.a, ld(p).r) * o.a, o.a);
         }
         case OP_LUT: {
             // a Color Grading LUT: p0.x = how much of it; i1.z: write the linear colour

@@ -262,6 +262,7 @@ pub enum FxOp {
     GradeAdvanced(Box<crate::gpufx_more::GradeAdvanced>),
     /// Color Grading's Input LUT.
     GradeLut(Box<crate::gpufx_more::GradeLut>),
+    GradeHsl(Box<crate::gpufx_more::GradeHsl>),
     DigitalGlitch(crate::gpufx_more::DigitalGlitch),
 }
 
@@ -757,7 +758,7 @@ impl FxOp {
                     gpu_capable,
                 };
                 // the rest of an SDR grade has passes of its own
-                if gpu_capable || is_hdr { basic } else { crate::gpufx_more::grade(e, cx, basic) }
+                if gpu_capable || is_hdr { basic } else { crate::gpufx_more::grade(e, cx, w, h, basic) }
             }
             _ => return None,
         })
@@ -823,6 +824,7 @@ impl FxOp {
             FxOp::Seq(ops) => ops.iter().all(FxOp::gpu_ok),
             FxOp::GradeAdvanced(g) => g.gpu_ok(),
             FxOp::GradeLut(l) => l.gpu_ok(),
+            FxOp::GradeHsl(k) => k.gpu_ok(),
             FxOp::DigitalGlitch(g) => g.gpu_ok(),
         }
     }
@@ -1150,6 +1152,7 @@ impl FxOp {
             FxOp::Seq(ops) => ops.iter().for_each(|op| op.apply(img)),
             FxOp::GradeAdvanced(g) => g.apply(img),
             FxOp::GradeLut(l) => l.apply(img),
+            FxOp::GradeHsl(k) => k.apply(img),
             FxOp::DigitalGlitch(g) => g.apply(img),
             FxOp::Mask { cov } => {
                 if cov.len().checked_mul(4) == Some(img.px.len()) {

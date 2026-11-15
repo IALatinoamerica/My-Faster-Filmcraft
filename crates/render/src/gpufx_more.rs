@@ -455,18 +455,139 @@ impl GradeAdvanced {
     }
 }
 
+/// Largest Denoise window radius the effect stage sorts per pixel (the radius at full resolution
+/// is 1 to 3; an oversized working image asks for more: the CPU's).
+pub const HSL_MAX_MEDIAN: usize = 3;
+
+/// Color Grading's HSL Secondary on an SDR sequence, as `effects::hsl_secondary`: a key from hue
+/// (`hc` ± `hr` / 2), saturation (from `smin`) and lightness (`lmin`..`lmax`) with soft edges,
+/// cleaned by a median of radius `median` mixed in by `denoise` (0: none) and blurred by box
+/// passes of `blur` radii (σ `sigma`); then the correction (`show_mask` 0) or a view of the key,
+/// mixed in by the key.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradeHsl {
+    pub hc: f32,
+    pub hr: f32,
+    pub smin: f32,
+    pub lmin: f32,
+    pub lmax: f32,
+    pub soft: f32,
+    pub show_mask: u32,
+    pub htemp: f32,
+    pub htint: f32,
+    pub hsat: f32,
+    pub hshift: f32,
+    pub denoise: f32,
+    pub median: usize,
+    pub sigma: f32,
+    pub blur: Vec<u32>,
+}
+
+impl GradeHsl {
+    /// None: HSL Secondary is off.
+    pub(crate) fn eval(e: &EffectInstance, cx: &FxCtx) -> Option<Self> {
+        use crate::effects::choice;
+        if !b(e, "hsl_on") {
+            return None;
+        }
+        let (denoise, blur) = (f(e, "hsl_denoise", cx).clamp(0.0, 100.0) / 100.0, f(e, "hsl_blur", cx).clamp(0.0, 100.0) / 100.0);
+        // (the comparisons are the CPU's: a NaN amount does nothing)
+        let median = if denoise > 0.0 { ((1.0 + 2.0 * denoise) * cx.px_scale).round().max(1.0) as usize } else { 0 };
+        let sigma = if blur > 0.0 { blur * 20.0 * cx.px_scale } else { 0.0 };
+        let radii =
+            if sigma >= 0.3 { crate::effects::boxes_for_gauss(sigma, 3).into_iter().map(|r| r.min(u32::MAX as usize) as u32).collect() } else { Vec::new() };
+        Some(Self {
+            hc: f(e, "hsl_hue", cx) / 360.0,
+            hr: (f(e, "hsl_hue_range", cx) / 360.0).max(1e-3),
+            smin: f(e, "hsl_sat_min", cx) / 100.0,
+            lmin: f(e, "hsl_luma_min", cx) / 100.0,
+            lmax: f(e, "hsl_luma_max", cx) / 100.0,
+            soft: (f(e, "hsl_soft", cx) / 100.0 * 0.3).max(0.01),
+            show_mask: choice(e, "hsl_show_mask"),
+            htemp: f(e, "hsl_temp", cx) / 100.0,
+            htint: f(e, "hsl_tint", cx) / 100.0,
+            hsat: f(e, "hsl_sat", cx) / 100.0,
+            hshift: f(e, "hsl_hue_shift", cx) / 360.0,
+            denoise,
+            median,
+            sigma,
+            blur: radii,
+        })
+    }
+
+    pub(crate) fn gpu_ok(&self) -> bool {
+        fin(&[self.hc, self.hr, self.smin, self.lmin, self.lmax, self.soft, self.htemp, self.htint, self.hsat, self.hshift, self.denoise, self.sigma])
+            && self.median <= HSL_MAX_MEDIAN
+            && self.blur.iter().all(|r| *r <= 1 << 14)
+    }
+
+    fn unit(c: [f32; 3]) -> [f32; 3] {
+        enc(c).map(|q| q.clamp(0.0, 1.0))
+    }
+
+    fn key(&self, v: [f32; 3]) -> f32 {
+        let h = rgb_to_hsl(v[0], v[1], v[2]);
+        let dh = (h[0] - self.hc).abs().min(1.0 - (h[0] - self.hc).abs());
+        let mh = 1.0 - ((dh - self.hr / 2.0) / self.soft).clamp(0.0, 1.0);
+        let ms = ((h[1] - self.smin) / self.soft).clamp(0.0, 1.0);
+        let ml = ((h[2] - self.lmin) / self.soft).clamp(0.0, 1.0).min(((self.lmax - h[2]) / self.soft).clamp(0.0, 1.0));
+        mh * ms * ml
+    }
+
+    pub(crate) fn apply(&self, img: &mut Image) {
+        let (w, h) = (img.w, img.h);
+        if w == 0 || h == 0 {
+            return;
+        }
+        let mut mask: Vec<f32> =
+            img.px.par_chunks(4).map(|p| if p[3] <= 1e-6 { 0.0 } else { self.key(Self::unit(Image::unpremul([p[0], p[1], p[2], p[3]]))) }).collect();
+        if self.median > 0 {
+            let med = crate::effects::median_filter(&mask, w, h, self.median);
+            let k = self.denoise.min(1.0);
+            mask.iter_mut().zip(med).for_each(|(m, d)| *m += (d - *m) * k);
+        }
+        if self.sigma >= 0.3 {
+            crate::effects::blur_plane(&mut mask, w, h, self.sigma);
+        }
+        let mask = &mask;
+        let (show_mask, htemp, htint, hsat, hshift) = (self.show_mask, self.htemp, self.htint, self.hsat, self.hshift);
+        img.map_rgb(|c, x, y| {
+            let m = mask[y * w + x];
+            let u = Self::unit(c);
+            let out = match show_mask {
+                1 => {
+                    let g = rgb_to_hsl(u[0], u[1], u[2])[2];
+                    [g + (u[0] - g) * m, g + (u[1] - g) * m, g + (u[2] - g) * m]
+                }
+                2 => u.map(|q| q * m),
+                3 => [m, m, m],
+                _ => {
+                    let mut hh = rgb_to_hsl(u[0], u[1], u[2]);
+                    hh[0] = (hh[0] + hshift).rem_euclid(1.0);
+                    hh[1] = (hh[1] * hsat).clamp(0.0, 1.0);
+                    let mut c2 = hsl_to_rgb(hh[0], hh[1], hh[2]);
+                    c2[0] *= 1.0 + 0.25 * htemp;
+                    c2[2] *= 1.0 - 0.25 * htemp;
+                    c2[1] *= 1.0 - 0.2 * htint;
+                    [u[0] + (c2[0] - u[0]) * m, u[1] + (c2[1] - u[1]) * m, u[2] + (c2[2] - u[2]) * m]
+                }
+            };
+            // (on SDR the CPU's HDR scale is 1: `q * 1.0` is `q`)
+            dec(out)
+        });
+    }
+}
+
 /// Color Grading with more than its Basic, Creative and Vignette controls in use on an SDR
 /// sequence: `basic` (the [`FxOp::Lumetri`] `eval` made, which declines such a grade) followed by
-/// the passes of the rest, as `effects::lumetri` runs them one after the other. What has no pass
-/// yet leaves `basic` as it came, so the CPU renders the effect.
-pub(crate) fn grade(e: &EffectInstance, cx: &FxCtx, mut basic: crate::gpufx::FxOp) -> crate::gpufx::FxOp {
+/// the passes of the rest, as `effects::lumetri` runs them one after the other: the Input LUT
+/// before it, then the Look, wheels and curves, HSL Secondary, and Creative's Sharpen (an Unsharp
+/// Mask of radius 1.2 working pixels) on a `w`×`h` working image.
+pub(crate) fn grade(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize, mut basic: crate::gpufx::FxOp) -> crate::gpufx::FxOp {
     use crate::effects::{on, text};
     use crate::gpufx::FxOp;
     let (basic_on, creative_on) = (on(e, "basic_on"), on(e, "creative_on"));
-    let sharpen = creative_on && (f(e, "sharpen", cx) / 100.0).abs() > 1e-3;
-    if sharpen || b(e, "hsl_on") {
-        return basic;
-    }
+    let sharpen = if creative_on { f(e, "sharpen", cx) / 100.0 } else { 0.0 };
     let FxOp::Lumetri { gpu_capable, .. } = &mut basic else { return basic };
     *gpu_capable = true;
     // (a reference to a LUT that is gone resolves to none, and the grade goes on without it)
@@ -474,6 +595,12 @@ pub(crate) fn grade(e: &EffectInstance, cx: &FxCtx, mut basic: crate::gpufx::FxO
     let mut ops: Vec<FxOp> = input_lut.map(|l| FxOp::GradeLut(Box::new(GradeLut::new(l)))).into_iter().collect();
     ops.push(basic);
     ops.extend(GradeAdvanced::eval(e, cx).map(|a| FxOp::GradeAdvanced(Box::new(a))));
+    ops.extend(GradeHsl::eval(e, cx).map(|k| FxOp::GradeHsl(Box::new(k))));
+    if sharpen.abs() > 1e-3 {
+        let r = 1.2 * cx.px_scale.max(0.35);
+        let (rx, ry) = gaussian_boxes(w, h, r, r);
+        ops.push(FxOp::Unsharp { rx, ry, amount: sharpen.max(-1.0), threshold: 0.0 });
+    }
     FxOp::Seq(ops)
 }
 
@@ -918,7 +1045,34 @@ mod tests {
         out.push(("lumetri", vec![("look_lut", builtin(true)), ("look_intensity", fl(60.0))]));
         out.push(("lumetri", vec![("look_lut", builtin(true)), ("look", ParamValue::Choice(3)), ("wheel_midtones_l", fl(40.0))]));
         all.extend([("input_lut", builtin(false)), ("look_lut", builtin(true)), ("look_intensity", fl(130.0))]);
-        out.push(("lumetri", all));
+        out.push(("lumetri", all.clone()));
+        // HSL Secondary: the key alone, cleaned, blurred, each view of it, and Sharpen
+        let on = ParamValue::Bool(true);
+        let key = vec![("hsl_on", on.clone()), ("hsl_hue", fl(120.0)), ("hsl_hue_range", fl(80.0)), ("hsl_sat_min", fl(10.0)), ("hsl_soft", fl(40.0))];
+        let with = |more: &[(&'static str, ParamValue)]| {
+            let mut p = key.clone();
+            p.extend(more.iter().cloned());
+            ("lumetri", p)
+        };
+        out.push(with(&[("hsl_sat", fl(30.0)), ("hsl_hue_shift", fl(90.0)), ("hsl_temp", fl(40.0)), ("hsl_tint", fl(-30.0))]));
+        out.push(with(&[("hsl_sat", fl(0.0)), ("hsl_denoise", fl(20.0))]));
+        out.push(with(&[("hsl_sat", fl(0.0)), ("hsl_denoise", fl(60.0)), ("hsl_blur", fl(15.0))]));
+        out.push(with(&[
+            ("hsl_hue_shift", fl(180.0)),
+            ("hsl_denoise", fl(100.0)),
+            ("hsl_blur", fl(40.0)),
+            ("hsl_luma_min", fl(20.0)),
+            ("hsl_luma_max", fl(80.0)),
+        ]));
+        for view in 1..=3 {
+            out.push(with(&[("hsl_show_mask", ParamValue::Choice(view)), ("hsl_blur", fl(5.0))]));
+        }
+        out.push(("lumetri", vec![("sharpen", fl(60.0))]));
+        out.push(("lumetri", vec![("sharpen", fl(-80.0)), ("contrast", fl(20.0))]));
+        let mut everything = all.clone();
+        everything.extend(key.clone());
+        everything.extend([("hsl_sat", fl(160.0)), ("hsl_blur", fl(10.0)), ("hsl_denoise", fl(30.0)), ("sharpen", fl(40.0))]);
+        out.push(("lumetri", everything));
         // a reference to a LUT that is not there: the grade goes on without it
         out.push((
             "lumetri",

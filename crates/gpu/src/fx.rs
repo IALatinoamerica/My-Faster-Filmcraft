@@ -73,6 +73,9 @@ const OP_EMBOSS: u32 = 112;
 const OP_GLITCH: u32 = 113;
 const OP_GRADE_ADV: u32 = 114;
 const OP_LUT: u32 = 115;
+const OP_HSL_KEY: u32 = 116;
+const OP_HSL_MEDIAN: u32 = 117;
+const OP_HSL_FINAL: u32 = 118;
 /// `effects::hash3`'s multiplier of the seed (the shader gets the product).
 const NOISE_SEED_MUL: u64 = 0x1656_67B1_9E37_79F9;
 
@@ -522,6 +525,29 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
             }
         }
         FxOp::GradeLut(l) => out.push(lut_step(l, 1.0, true)),
+        FxOp::GradeHsl(k) => {
+            // The key is a function of the picture alone: the picture stays untouched in one
+            // texture while the key is made, cleaned and blurred in the others (as Ultra Key's
+            // matte).
+            let p = [k.hc, k.hr, k.smin, k.lmin, k.lmax, k.soft, k.htemp, k.htint, k.hsat, k.hshift, k.denoise.min(1.0)];
+            let i1 = [k.show_mask, k.median as u32, 0, 0];
+            let mut key = step(OP_HSL_KEY, i1, &p);
+            key.reads_orig = true;
+            out.push(key);
+            let first = out.len();
+            if k.median > 0 {
+                out.push(step(OP_HSL_MEDIAN, i1, &p));
+            }
+            boxes(&k.blur, false, true, &mut out);
+            boxes(&k.blur, true, true, &mut out);
+            for s in out.iter_mut().skip(first) {
+                s.unsharp_blur = true;
+            }
+            let mut last = step(OP_HSL_FINAL, i1, &p);
+            last.reads_orig = true;
+            last.combine = true;
+            out.push(last);
+        }
         FxOp::Emboss(m) => out.push(step(OP_EMBOSS, [0; 4], &[m.dx, m.dy, m.contrast, m.blend])),
         FxOp::DigitalGlitch(g) => {
             // (no rows: the effect does nothing)

@@ -824,15 +824,19 @@ fn hostile_parameters_are_bounded() {
 #[test]
 fn lumetri_unsupported_sections_fall_back() {
     let (w, h) = (40usize, 24usize);
-    // sharpen > 0 and input LUT (explicitly required by brief)
-    let e = effect("lumetri", &[("sharpen", fl(10.0)), ("input_lut", ParamValue::Text("custom.cube".into()))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()), "sharpen > 0 and input_lut must fall back to CPU");
-
-    // sharpen alone
-    let e = effect("lumetri", &[("sharpen", fl(20.0))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+    // Sharpen and HSL Secondary have passes of their own
+    for params in [
+        vec![("sharpen", fl(10.0)), ("input_lut", ParamValue::Text("custom.cube".into()))],
+        vec![("sharpen", fl(20.0))],
+        vec![("hsl_on", ParamValue::Bool(true))],
+    ] {
+        let op = FxOp::eval(&effect("lumetri", &params), &cx(Tick::ZERO, 1.0), w, h);
+        assert!(op.as_ref().is_some_and(FxOp::gpu_ok), "{params:?} runs on the GPU");
+    }
+    // a Denoise window larger than the stage sorts (an oversized working image) is the CPU's
+    let e = effect("lumetri", &[("hsl_on", ParamValue::Bool(true)), ("hsl_denoise", fl(100.0))]);
+    let op = FxOp::eval(&e, &cx(Tick::ZERO, 4.0), w, h);
+    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()), "a 12 px median must fall back to CPU");
 
     // a LUT reference that resolves to no LUT is no LUT on the CPU either: the grade runs on the
     // GPU without it (the LUTs themselves: `gpu_color_grading_luts_match_cpu`)
@@ -853,11 +857,6 @@ fn lumetri_unsupported_sections_fall_back() {
         let op = FxOp::eval(&effect("lumetri", &params), &cx(Tick::ZERO, 1.0), w, h);
         assert!(op.as_ref().is_some_and(FxOp::gpu_ok), "{params:?} runs on the GPU");
     }
-
-    // HSL secondary on
-    let e = effect("lumetri", &[("hsl_on", ParamValue::Bool(true))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
 
     // HDR working space
     let e = effect("lumetri", &[]);
@@ -1339,4 +1338,43 @@ fn gpu_color_grading_luts_match_cpu() {
     // a LUT larger than the stage takes is declined
     let big = filmcraft_color::Lut::from_cube(filmcraft_color::Lut3d::identity(filmcraft_render::gpufx_more::LUT_MAX_CUBE + 1));
     assert!(!FxOp::GradeLut(Box::new(filmcraft_render::gpufx_more::GradeLut::new(Arc::new(big)))).gpu_ok());
+}
+
+/// Color Grading's HSL Secondary (the key alone, cleaned by the median, blurred, each view of the
+/// key) and Sharpen, alone and with every other section of the grade in use.
+#[test]
+fn gpu_color_grading_hsl_secondary_and_sharpen_match_cpu() {
+    let on = ParamValue::Bool(true);
+    let key = vec![("hsl_on", on), ("hsl_hue", fl(120.0)), ("hsl_hue_range", fl(80.0)), ("hsl_sat_min", fl(10.0)), ("hsl_soft", fl(40.0))];
+    let with = |more: &[(&'static str, ParamValue)]| {
+        let mut p = key.clone();
+        p.extend(more.iter().cloned());
+        (vec![effect("lumetri", &p)], 1e-5)
+    };
+    let mut chains = vec![
+        with(&[("hsl_sat", fl(30.0)), ("hsl_hue_shift", fl(90.0)), ("hsl_temp", fl(40.0)), ("hsl_tint", fl(-30.0))]),
+        with(&[("hsl_sat", fl(0.0)), ("hsl_denoise", fl(20.0))]),
+        with(&[("hsl_sat", fl(0.0)), ("hsl_denoise", fl(60.0)), ("hsl_blur", fl(15.0))]),
+        with(&[("hsl_hue_shift", fl(180.0)), ("hsl_denoise", fl(100.0)), ("hsl_blur", fl(40.0)), ("hsl_luma_min", fl(20.0)), ("hsl_luma_max", fl(80.0))]),
+    ];
+    for view in 1..=3 {
+        chains.push(with(&[("hsl_show_mask", ch(view)), ("hsl_blur", fl(5.0))]));
+    }
+    chains.push((vec![effect("lumetri", &[("sharpen", fl(60.0))])], 1e-5));
+    chains.push((vec![effect("lumetri", &[("sharpen", fl(-80.0)), ("contrast", fl(20.0))])], 1e-5));
+    let builtin = |look: bool| {
+        let b = filmcraft_render::luts::builtins().iter().find(|b| b.id.starts_with("look-") == look).expect("a built-in LUT");
+        ParamValue::Text(format!("builtin:{}", b.id))
+    };
+    let [wheels, rgb, hue] = grade_parts();
+    let mut everything = vec![("input_lut", builtin(false)), ("look_lut", builtin(true)), ("contrast", fl(25.0)), ("vignette_amount", fl(-2.0))];
+    everything.extend(wheels);
+    everything.extend(rgb);
+    everything.extend(hue);
+    everything.extend(key.clone());
+    everything.extend([("hsl_sat", fl(160.0)), ("hsl_blur", fl(10.0)), ("hsl_denoise", fl(30.0)), ("sharpen", fl(40.0))]);
+    let blur = effect("gaussian_blur", &[("blurriness", fl(4.0))]);
+    chains.push((vec![effect("lumetri", &everything)], 2e-5));
+    chains.push((vec![blur.clone(), effect("lumetri", &everything), blur], 2e-5));
+    check_chains(96, 54, Tick::ZERO, &chains);
 }
