@@ -491,9 +491,7 @@ fn an_adjustment_layer_the_gpu_cant_run_plans_the_frame_on_the_cpu() {
                 set(s, a, "transform", "scale_height", ParamValue::Float(40.0));
             }),
         ),
-        ("opacity 50 %", Box::new(|s, a| set(s, a, "opacity", "opacity", ParamValue::Float(50.0)))),
         ("Multiply", Box::new(move |s, a| set(s, a, "opacity", "blend", ParamValue::Choice(multiply)))),
-        ("Motion at 50 %", Box::new(|s, a| set(s, a, "motion", "scale", ParamValue::Float(50.0)))),
     ];
     for scale in [1.0, 0.5] {
         let opts = RenderOptions { scale, ..Default::default() };
@@ -677,5 +675,110 @@ fn a_shutter_transform_adjustment_layer_plans_for_the_gpu() {
         let got = execute_cpu(&plan);
         let max = got.px.iter().zip(&reference.px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
         assert!(max < 0.02, "frame {frame}: max diff {max}");
+    }
+}
+
+/// An adjustment layer that keeps part of the picture below it (moved or scaled by Motion, not
+/// opaque, with an opacity mask) is a step for the GPU that ends in the mix with that picture,
+/// and the step renders what the CPU renderer renders. A layer nudged by a few pixels used to
+/// send every frame under it to the CPU.
+#[test]
+fn an_adjustment_layer_that_keeps_part_of_the_picture_below_plans_for_the_gpu() {
+    use crate::gpufx::FxOp;
+    use crate::plan::{DeviceCaps, FramePlan, PlanStep, execute_cpu, is_cpu_frame, plan_frame};
+    let base = || {
+        let mut s = scene(2);
+        let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
+        place(&mut s.p, s.seq, 0, ocean);
+        let adj = adjustment(&mut s.p, s.seq, 1);
+        fx(&mut s, adj, "invert");
+        fx(&mut s, adj, "gaussian_blur");
+        set(&mut s, adj, "gaussian_blur", "blurriness", ParamValue::Float(6.0));
+        (s, adj)
+    };
+    let mask = |s: &mut Scene, a: ClipId| {
+        let mut m = Mask::new("o", MaskPath::rect(100.0, 20.0, 300.0, 150.0));
+        m.feather.value = ParamValue::Float(12.0);
+        clip(s, a).effect_mut("opacity").unwrap().masks.push(m);
+    };
+    let nudge = |s: &mut Scene, a: ClipId| set(s, a, "motion", "position", ParamValue::Vec2(filmcraft_geom::Vec2::new(160.0, 100.0)));
+    // (what, the change, whether the weight is a plane)
+    type Case = (&'static str, Box<dyn Fn(&mut Scene, ClipId)>, bool);
+    let cases: Vec<Case> = vec![
+        ("nudged 10 px down", Box::new(nudge), true),
+        ("Motion at 50 %", Box::new(|s, a| set(s, a, "motion", "scale", ParamValue::Float(50.0))), true),
+        ("rotated", Box::new(|s, a| set(s, a, "motion", "rotation", ParamValue::Float(20.0))), true),
+        ("opacity 50 %", Box::new(|s, a| set(s, a, "opacity", "opacity", ParamValue::Float(50.0))), false),
+        ("an opacity mask", Box::new(mask), true),
+        (
+            "nudged, masked and at 70 %",
+            Box::new(move |s, a| {
+                nudge(s, a);
+                mask(s, a);
+                set(s, a, "opacity", "opacity", ParamValue::Float(70.0));
+            }),
+            true,
+        ),
+    ];
+    for scale in [1.0, 0.5] {
+        let opts = RenderOptions { scale, ..Default::default() };
+        for (what, change, plane) in &cases {
+            let (mut s, adj) = base();
+            change(&mut s, adj);
+            let t = R.tick_of(12);
+            assert!(!is_cpu_frame(&s.p, s.seq, t, opts, DeviceCaps::ALL), "{what} at {scale}");
+            let plan = plan_frame(&s.p, s.seq, t, opts, DeviceCaps::ALL, &s.map);
+            let FramePlan::Composite { steps, .. } = &plan else { panic!("{what} at {scale}: planned as one CPU image") };
+            let ops = steps.iter().find_map(|st| if let PlanStep::Adjust { ops } = st { Some(ops) } else { None }).expect("an adjustment step");
+            let Some(FxOp::MixBase { cov, .. }) = ops.last() else { panic!("{what} at {scale}: no mix with the picture below") };
+            assert_eq!(cov.is_some(), *plane, "{what} at {scale}");
+            assert!(ops.iter().all(FxOp::gpu_ok), "{what} at {scale}");
+            let reference = render_sequence(&s.p, s.seq, t, opts, &s.map);
+            let diff = max_diff(&execute_cpu(&plan), &reference);
+            assert!(diff < 1e-4, "{what} at {scale}: max diff {diff}");
+            // the layer does change the picture, and not all of it
+            let (mut plain, _) = base();
+            let only = plain.p.sequence_mut(plain.seq).unwrap();
+            only.video_tracks[1].items.clear();
+            let below = render_sequence(&plain.p, plain.seq, t, opts, &plain.map);
+            assert!(max_diff(&reference, &below) > 0.05, "{what} at {scale}: the layer did nothing");
+            // a plane is made once for the frames that share it (the planes are shared by every
+            // test running at the same time, which may push one out: try again then)
+            if *plane {
+                let last = |t: Tick| {
+                    let FramePlan::Composite { steps, .. } = plan_frame(&s.p, s.seq, t, opts, DeviceCaps::ALL, &s.map) else { panic!("{what}: a CPU image") };
+                    steps.into_iter().find_map(|st| if let PlanStep::Adjust { mut ops } = st { ops.pop() } else { None })
+                };
+                let shared = (0..20).any(|_| {
+                    let (Some(FxOp::MixBase { cov: Some(a), .. }), Some(FxOp::MixBase { cov: Some(b), .. })) = (last(R.tick_of(12)), last(R.tick_of(13)))
+                    else {
+                        panic!("{what}: planes")
+                    };
+                    std::sync::Arc::ptr_eq(&a, &b)
+                });
+                assert!(shared, "{what} at {scale}: the next frame made its own plane");
+            }
+        }
+    }
+}
+
+/// Hostile Motion and opacity values on an adjustment layer plan and render without panicking.
+#[test]
+fn hostile_adjustment_layer_placement_plans_without_panicking() {
+    use crate::plan::{DeviceCaps, execute_cpu, plan_frame};
+    for v in [f64::NAN, f64::INFINITY, -1e30, 1e30, 0.0, -100.0] {
+        for param in ["scale", "rotation", "opacity"] {
+            let mut s = scene(2);
+            let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
+            place(&mut s.p, s.seq, 0, ocean);
+            let adj = adjustment(&mut s.p, s.seq, 1);
+            fx(&mut s, adj, "invert");
+            let effect = if param == "opacity" { "opacity" } else { "motion" };
+            set(&mut s, adj, effect, param, ParamValue::Float(v));
+            set(&mut s, adj, "motion", "position", ParamValue::Vec2(filmcraft_geom::Vec2::new(v, 90.0)));
+            let plan = plan_frame(&s.p, s.seq, R.tick_of(12), RenderOptions::default(), DeviceCaps::ALL, &s.map);
+            let img = execute_cpu(&plan);
+            assert_eq!((img.w, img.h), (320, 180), "{param} = {v}");
+        }
     }
 }

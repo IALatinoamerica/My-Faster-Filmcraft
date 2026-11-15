@@ -67,6 +67,7 @@ const OP_NOISE: u32 = 106;
 const OP_KEY_MATTE: u32 = 107;
 const OP_KEY_CHOKE: u32 = 108;
 const OP_KEY_FINAL: u32 = 109;
+const OP_MIX_BASE: u32 = 110;
 /// `effects::hash3`'s multiplier of the seed (the shader gets the product).
 const NOISE_SEED_MUL: u64 = 0x1656_67B1_9E37_79F9;
 
@@ -129,6 +130,12 @@ struct Step {
     /// the sum so far and, as the aux texture, the original, which stays untouched until the last
     /// pass (`combine`).
     reads_orig: bool,
+    /// The mix of an adjustment layer with the picture below it: reads, as the aux texture, the
+    /// picture the job started from (its first texture, kept untouched while such a job runs).
+    mix_base: bool,
+    /// A table of numbers read through the table binding: (values, width, height), one `R32Float`
+    /// texel each, row by row (a coverage plane, curves, a LUT).
+    table: Option<(std::sync::Arc<Vec<f32>>, u32, u32)>,
 }
 
 fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
@@ -136,7 +143,7 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
     for (d, s) in q.iter_mut().zip(p) {
         *d = *s;
     }
-    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), plane: None, reads_orig: false }
+    Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), plane: None, reads_orig: false, mix_base: false, table: None }
 }
 
 /// Texels a row of a kernel texture holds.
@@ -443,6 +450,16 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
                 last.combine = true;
             }
         }
+        FxOp::MixBase { weight, cov } => {
+            // a plane of another size is a no-op, as on the CPU
+            let fits = cov.as_ref().is_none_or(|c| (w as usize).checked_mul(h as usize) == Some(c.len()));
+            if fits {
+                let mut s = step(OP_MIX_BASE, [cov.is_some() as u32, 0, 0, 0], &[*weight]);
+                s.mix_base = true;
+                s.table = cov.as_ref().map(|c| (c.clone(), w, h));
+                out.push(s);
+            }
+        }
         FxOp::Mask { cov } => {
             // a plane of another size is a no-op, as on the CPU
             if (w as usize).checked_mul(h as usize) == Some(cov.len()) {
@@ -503,6 +520,7 @@ impl FxStage {
                     count: None,
                 },
                 tex(3),
+                tex(4),
             ],
         });
         let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor { label: Some("fx"), bind_group_layouts: &[Some(&bgl)], immediate_size: 0 });
@@ -662,7 +680,9 @@ impl FxStage {
             return None;
         }
         let all: Vec<Step> = fx.ops.iter().flat_map(|op| steps(op, w, h)).collect();
-        let n = if all.iter().any(|s| s.combine) { 3 } else { 2 };
+        // the picture the job starts from, when a step mixes with it at the end: never written to
+        let base = all.iter().any(|s| s.mix_base).then_some(0usize);
+        let n = 2 + all.iter().any(|s| s.combine) as usize + base.is_some() as usize;
         let targets = self.targets(device, (w, h), n);
         let views: Vec<wgpu::TextureView> = targets.iter().map(|t| t.1.clone()).collect();
         let mut dispatches = Vec::with_capacity(all.len());
@@ -675,15 +695,22 @@ impl FxStage {
                 orig = Some(cur);
             }
             let keep = if s.unsharp_blur || s.combine || s.reads_orig { orig } else { None };
-            let dst = (0..n).find(|k| *k != cur && Some(*k) != keep)?;
+            let dst = (0..n).find(|k| *k != cur && Some(*k) != keep && Some(*k) != base)?;
             let kernel = match &s.plane {
                 Some(cov) => Some(self.plane_texture(device, queue, cov, w, h)),
                 None => (!s.kernel.is_empty()).then(|| kernel_texture(device, queue, &s.kernel)),
             };
-            let aux = match (s.combine || s.reads_orig, orig, &kernel) {
-                (true, Some(o), _) => views.get(o)?,
-                (_, _, Some(k)) => k,
+            let aux = match (s.mix_base, base, s.combine || s.reads_orig, orig, &kernel) {
+                (true, Some(b), ..) => views.get(b)?,
+                (_, _, true, Some(o), _) => views.get(o)?,
+                (.., Some(k)) => k,
                 _ => dummy,
+            };
+            let table = match &s.table {
+                Some((values, tw, th)) if (*tw as usize).checked_mul(*th as usize) == Some(values.len()) && *tw <= max && *th <= max && !values.is_empty() => {
+                    Some(self.plane_texture(device, queue, values, *tw, *th))
+                }
+                _ => None,
             };
             let mut bytes = Vec::with_capacity(128);
             for v in [s.code, w, h, 0].iter().chain(&s.i1) {
@@ -707,6 +734,7 @@ impl FxStage {
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(views.get(cur)?) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(views.get(dst)?) },
                     wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(aux) },
+                    wgpu::BindGroupEntry { binding: 4, resource: wgpu::BindingResource::TextureView(table.as_ref().unwrap_or(dummy)) },
                 ],
             });
             let groups = if s.run {

@@ -234,6 +234,16 @@ pub enum FxOp {
     Mask {
         cov: std::sync::Arc<Vec<f32>>,
     },
+    /// The last op of an adjustment layer that does not simply replace the picture below it: the
+    /// picture the layer's ops started from (the base) mixed with their result, pixel by pixel,
+    /// `base + (result − base) × weight × cov`. `cov` is `crate::adjustment_weight`'s plane (the
+    /// layer's opacity, opacity masks and the coverage of its frame), row by row; without one the
+    /// weight is the same everywhere. [`apply`](Self::apply) has no base and leaves the image as
+    /// it is: whoever runs the ops keeps the base and calls [`mix_base`](Self::mix_base).
+    MixBase {
+        weight: f32,
+        cov: Option<std::sync::Arc<Vec<f32>>>,
+    },
     /// Transform with its own shutter angle: the mean of the working image placed by each of
     /// `samples` (the motion while the shutter is open).
     ResampleBlur {
@@ -785,11 +795,36 @@ impl FxOp {
                     && fin(&[*va, *vmid, *vround, *vfeather, *aspect])
             }
             FxOp::Mask { .. } => true,
+            FxOp::MixBase { weight, .. } => weight.is_finite(),
             FxOp::LumaKey(k) => k.gpu_ok(),
             FxOp::RoundedCrop(c) => c.gpu_ok(),
             FxOp::DropShadow(d) => d.gpu_ok(),
             FxOp::Noise(n) => n.gpu_ok(),
             FxOp::UltraKey(k) => k.gpu_ok(),
+        }
+    }
+
+    /// [`FxOp::MixBase`]: mix `base` (the picture from before the ops) into `img` (their result).
+    /// Any other op, or a plane or base of another size, leaves `img` as it is.
+    pub fn mix_base(&self, img: &mut Image, base: &Image) {
+        let FxOp::MixBase { weight, cov } = self else { return };
+        if base.px.len() != img.px.len() {
+            return;
+        }
+        match cov {
+            Some(cov) if cov.len().checked_mul(4) == Some(img.px.len()) => {
+                if (*weight - 1.0).abs() < f32::EPSILON {
+                    crate::mask::mix(img, base, cov);
+                } else {
+                    let scaled: Vec<f32> = cov.iter().map(|c| c * weight).collect();
+                    crate::mask::mix(img, base, &scaled);
+                }
+            }
+            Some(_) => {}
+            None => {
+                let k = *weight;
+                img.px.par_iter_mut().zip(base.px.par_iter()).for_each(|(p, o)| *p = *o + (*p - *o) * k);
+            }
         }
     }
 
@@ -1092,6 +1127,8 @@ impl FxOp {
                     crate::mask::scale_by(img, cov);
                 }
             }
+            // (needs the base: `mix_base`)
+            FxOp::MixBase { .. } => {}
             FxOp::AlphaAdjust { opacity, ignore, invert, mask_only } => {
                 let (op, ignore, invert, mask_only) = (*opacity, *ignore, *invert, *mask_only);
                 img.px.par_chunks_mut(4).for_each(|p| {

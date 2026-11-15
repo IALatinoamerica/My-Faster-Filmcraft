@@ -19,6 +19,8 @@ struct U {
 @group(0) @binding(2) var dst: texture_storage_2d<rgba32float, write>;
 // Unsharp Mask: the image before blurring.
 @group(0) @binding(3) var aux: texture_2d<f32>;
+// A table of numbers for the pass (a coverage plane, curves, a LUT): one value per texel.
+@group(0) @binding(4) var tbl: texture_2d<f32>;
 
 const OP_BRIGHTNESS_CONTRAST: u32 = 1u;
 const OP_PROC_AMP: u32 = 2u;
@@ -65,6 +67,7 @@ const OP_NOISE: u32 = 106u;
 const OP_KEY_MATTE: u32 = 107u;
 const OP_KEY_CHOKE: u32 = 108u;
 const OP_KEY_FINAL: u32 = 109u;
+const OP_MIX_BASE: u32 = 110u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -925,6 +928,15 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             let na = a * o.a;
             return vec4(l * na, na);
+        }
+        case OP_MIX_BASE: {
+            // an adjustment layer over the picture below it (`aux`): `FxOp::mix_base`
+            let o = textureLoad(aux, p, 0);
+            var k = u.p0.x;
+            if u.i1.x != 0u {
+                k = k * textureLoad(tbl, p, 0).r;
+            }
+            return o + (ld(p) - o) * k;
         }
         case OP_MASK: {
             // opacity masks: `mask::scale_by` with the coverage plane in `aux`

@@ -419,12 +419,7 @@ fn adjustment_ops(project: &Project, seq: &Sequence, it: &TrackItem, t: Tick, sc
     let mt = it.effect_time_at(t);
     let (op, bl) = crate::opacity_blend(it, mt);
     let (w, h) = output_size(seq, scale);
-    if !caps.adjusts(w, h)
-        || op < 1.0 - 1e-6
-        || bl != Blend::Normal
-        || it.has_opacity_masks()
-        || !crate::adjustment_covers_output(seq, it, project, mt, scale, w, h)
-    {
+    if !caps.adjusts(w, h) || bl != Blend::Normal || !op.is_finite() {
         return None;
     }
     let cx = crate::effects::FxCtx {
@@ -439,14 +434,67 @@ fn adjustment_ops(project: &Project, seq: &Sequence, it: &TrackItem, t: Tick, sc
         frame_rate: seq.settings.frame_rate.as_f64(),
         working: seq.settings.color.working,
     };
-    it.effects
+    let mut ops: Vec<FxOp> = it
+        .effects
         .iter()
         .filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic))
         .map(|e| {
             let gpu = e.masks.iter().all(|m| m.mode == filmcraft_project::MaskMode::None) && crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str());
             if gpu { FxOp::eval(e, &cx, w, h).filter(FxOp::gpu_ok) } else { None }
         })
-        .collect()
+        .collect::<Option<_>>()?;
+    // a layer that is not opaque, is masked or does not cover the frame keeps part of the picture
+    // below it
+    if !ops.is_empty() {
+        let partial = it.has_opacity_masks() || !crate::adjustment_covers_output(seq, it, project, mt, scale, w, h);
+        if partial {
+            ops.push(FxOp::MixBase { weight: 1.0, cov: Some(adjustment_plane(project, seq, it, mt, scale, (w, h), op)) });
+        } else if op < 1.0 - 1e-6 {
+            ops.push(FxOp::MixBase { weight: op, cov: None });
+        }
+    }
+    Some(ops)
+}
+
+/// What decides an adjustment layer's weight plane: its opacity masks flattened for the output,
+/// its opacity, its frame and Motion map, and the output size.
+#[derive(PartialEq)]
+struct AdjustmentPlaneKey {
+    masks: Vec<crate::mask::FlatMask>,
+    opacity: u32,
+    frame: (usize, usize, [u64; 6]),
+    size: (usize, usize),
+}
+
+/// Weight planes of adjustment layers made so far, most recently used last. A layer whose
+/// Motion, opacity and masks have no keyframes makes one plane for all its frames, and the
+/// compositor finds the uploaded plane by its address.
+static ADJUSTMENT_PLANES: std::sync::Mutex<Vec<(AdjustmentPlaneKey, Arc<Vec<f32>>)>> = std::sync::Mutex::new(Vec::new());
+const MAX_ADJUSTMENT_PLANES: usize = 8;
+
+/// `crate::adjustment_weight` of the layer `it` (opacity `op`) for a `w`×`h` output, made once
+/// for every frame that needs the same plane.
+fn adjustment_plane(project: &Project, seq: &Sequence, it: &TrackItem, mt: Tick, scale: f32, (w, h): (usize, usize), op: f32) -> Arc<Vec<f32>> {
+    let masks = it.effect("opacity").filter(|e| e.enabled).map(|e| crate::mask::prepare(&e.masks, mt, scale)).unwrap_or_default();
+    let (fw, fh, m) = crate::adjustment_frame(seq, it, project, mt, scale);
+    let key = AdjustmentPlaneKey { masks, opacity: op.to_bits(), frame: (fw, fh, [m.a, m.b, m.c, m.d, m.e, m.f].map(f64::to_bits)), size: (w, h) };
+    {
+        let mut planes = ADJUSTMENT_PLANES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = planes.iter().position(|(k, _)| *k == key) {
+            let hit = planes.remove(i);
+            let cov = hit.1.clone();
+            planes.push(hit);
+            return cov;
+        }
+    }
+    // made without the lock: other frames' jobs plan meanwhile
+    let cov = Arc::new(crate::adjustment_weight(seq, it, project, mt, scale, (w, h), op));
+    let mut planes = ADJUSTMENT_PLANES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if planes.len() >= MAX_ADJUSTMENT_PLANES {
+        planes.remove(0);
+    }
+    planes.push((key, cov.clone()));
+    cov
 }
 
 /// Whether the frame of `seq` at `t` and render `scale` can be planned as layers for a device that
@@ -806,8 +854,12 @@ pub fn execute_cpu(plan: &FramePlan) -> crate::Image {
                         crate::blend::composite(&mut canvas, &mixed, 1.0, Blend::Normal);
                     }
                     PlanStep::Adjust { ops } => {
+                        let base = ops.iter().any(|op| matches!(op, FxOp::MixBase { .. })).then(|| canvas.clone());
                         for op in ops {
-                            op.apply(&mut canvas);
+                            match &base {
+                                Some(base) if matches!(op, FxOp::MixBase { .. }) => op.mix_base(&mut canvas, base),
+                                _ => op.apply(&mut canvas),
+                            }
                         }
                     }
                 }

@@ -373,15 +373,7 @@ fn adjustment_layer(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick
         }
     }
     let (op, bl) = opacity_blend(item, mt);
-    // Adjustment layer opacity (and opacity masks, in sequence pixels) weigh adjusted against original.
-    let mut weight = Image::filled(w, h, [op; 4]);
-    mask::apply_opacity_masks(&mut weight, item, mt, opts.scale);
-    // Motion moves / scales the adjustment layer's frame: it only applies inside it.
-    if let Some(region) = adjustment_region(seq, item, project, mt, opts.scale, w, h) {
-        let cov: Vec<f32> = region.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
-        mask::scale_by(&mut weight, &cov);
-    }
-    let cov: Vec<f32> = weight.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+    let cov = adjustment_weight(seq, item, project, mt, opts.scale, (w, h), op);
     if bl == Blend::Normal {
         // The adjusted picture replaces the original instead of being drawn over it: what
         // Transform or Basic 3D leave empty shows nothing of the untransformed picture (#1524).
@@ -390,6 +382,20 @@ fn adjustment_layer(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick
         mask::scale_by(&mut adj, &cov);
     }
     (adj, bl)
+}
+
+/// How much of the adjusted picture each pixel of the `w`×`h` output takes (the rest is the
+/// picture below): the layer's opacity `op`, its opacity masks (in sequence pixels) and the
+/// coverage of its Motion-placed frame, which is all the layer applies to. The GPU plan mixes with
+/// the same plane ([`gpufx::FxOp::MixBase`]).
+pub(crate) fn adjustment_weight(seq: &Sequence, item: &TrackItem, project: &Project, mt: Tick, scale: f32, (w, h): (usize, usize), op: f32) -> Vec<f32> {
+    let mut weight = Image::filled(w, h, [op; 4]);
+    mask::apply_opacity_masks(&mut weight, item, mt, scale);
+    if let Some(region) = adjustment_region(seq, item, project, mt, scale, w, h) {
+        let cov: Vec<f32> = region.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect();
+        mask::scale_by(&mut weight, &cov);
+    }
+    weight.px.as_chunks::<4>().0.iter().map(|p| p[3]).collect()
 }
 
 /// Coverage of an adjustment layer's (Motion-transformed) frame in output pixels, or `None` when
@@ -410,7 +416,7 @@ pub(crate) fn adjustment_covers_output(seq: &Sequence, item: &TrackItem, project
 }
 
 /// An adjustment layer's frame size at `scale` and its Motion map into output pixels.
-fn adjustment_frame(seq: &Sequence, item: &TrackItem, project: &Project, mt: Tick, scale: f32) -> (usize, usize, Affine) {
+pub(crate) fn adjustment_frame(seq: &Sequence, item: &TrackItem, project: &Project, mt: Tick, scale: f32) -> (usize, usize, Affine) {
     let size = source_size(project, item.item).unwrap_or((seq.settings.width, seq.settings.height));
     let motion = motion_matrix(seq, item, size, source_par(project, item.item), mt);
     let s = scale as f64;

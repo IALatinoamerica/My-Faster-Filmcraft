@@ -1113,3 +1113,64 @@ fn effect_source_integer_decimation_preserves_cpu_box_oracle() {
         }
     }
 }
+
+/// The CPU reference of an op list that may end in `FxOp::MixBase`: as `plan::execute_cpu` runs it.
+fn apply_with_base(ops: &[FxOp], px: &[f32], w: u32, h: u32) -> filmcraft_render::Image {
+    let base = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.to_vec() };
+    let mut img = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.to_vec() };
+    for op in ops {
+        if matches!(op, FxOp::MixBase { .. }) {
+            op.mix_base(&mut img, &base);
+        } else {
+            op.apply(&mut img);
+        }
+    }
+    img
+}
+
+/// An adjustment layer that keeps part of the picture below it: the result of its effects mixed
+/// with the picture they started from, by a plane or by one weight, also after effects that keep
+/// an original of their own (Unsharp Mask, a shutter Transform); a plane of another size is a
+/// no-op on both paths.
+#[test]
+fn gpu_adjustment_mix_with_the_picture_below_matches_cpu_exactly() {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (67u32, 41u32);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let cov: Vec<f32> = (0..w * h).map(|i| if (i / w) < 10 { 0.0 } else { ((i % w) as f32 / (w - 1) as f32 * 1.5 - 0.25).clamp(0.0, 1.0) }).collect();
+    let good = std::sync::Arc::new(cov);
+    let odd = std::sync::Arc::new(vec![0.5f32; 7]);
+    let at = cx(Tick::from_seconds_f64(0.5), 1.0);
+    let eval = |e: &filmcraft_project::EffectInstance| FxOp::eval(e, &at, w as usize, h as usize).expect("op");
+    let blur = eval(&effect("gaussian_blur", &[("blurriness", fl(6.0))]));
+    let unsharp = eval(&effect("unsharp_mask", &[("amount", fl(150.0)), ("radius", fl(3.0))]));
+    let mut zoom = effect("transform", &[("shutter_override", ParamValue::Bool(true)), ("shutter_angle", fl(360.0))]);
+    let p = zoom.params.get_mut("scale_height").expect("scale");
+    p.put_keyframe(Tick::ZERO, fl(100.0));
+    p.put_keyframe(Tick::from_seconds_f64(1.0), fl(190.0));
+    let zoom = eval(&zoom);
+    assert!(matches!(zoom, FxOp::ResampleBlur { .. }), "the zoom moves while the shutter is open");
+    let chains = [
+        vec![blur.clone(), FxOp::MixBase { weight: 1.0, cov: Some(good.clone()) }],
+        vec![blur.clone(), FxOp::MixBase { weight: 0.4, cov: None }],
+        vec![blur.clone(), FxOp::MixBase { weight: 0.7, cov: Some(good.clone()) }],
+        vec![unsharp, zoom, blur.clone(), FxOp::MixBase { weight: 1.0, cov: Some(good.clone()) }],
+        vec![FxOp::MixBase { weight: 1.0, cov: Some(good) }],
+        vec![blur, FxOp::MixBase { weight: 1.0, cov: Some(odd) }],
+    ];
+    for ops in chains {
+        assert!(ops.iter().all(FxOp::gpu_ok));
+        let cpu = apply_with_base(&ops, &px, w, h);
+        for _ in 0..2 {
+            let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, turns: 0, ops: ops.clone() }).expect("effect image");
+            let (worst, flips) = compare(&cpu.px, &gpu);
+            assert!(worst < EXACT * 2.0 && flips == 0.0, "{} ops: {worst}, {flips}", ops.len());
+        }
+    }
+    assert!(!FxOp::MixBase { weight: f32::NAN, cov: None }.gpu_ok());
+}
