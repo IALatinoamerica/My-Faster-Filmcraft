@@ -315,7 +315,7 @@ fn enter_renders_the_red_segment_and_leaves_the_yellow_one() {
     let mut p = (*s.project).clone();
     let matte = GeneratorSource::new(Generator::ColorMatte { color: [0.2, 0.5, 0.8, 1.0] }, 1920, 1080, r, Tick(TICKS_PER_SECOND));
     let matte = crate::demo::add_generator(&mut p, &s.media, matte, "Matte", Label::Iris, None);
-    // 1080p, where four heavy effects cost more than a frame lasts (red) and a Tint does not
+    // 1080p, where four heavy effects on the CPU cost more than a frame lasts (red) and a Tint does not
     let seq = p.new_sequence("Seq", SequenceSettings { width: 1920, height: 1080, frame_rate: r, ..Default::default() }, 1, 1, None);
     let clip = |p: &mut filmcraft_project::Project, at: i64, fx: &[&str]| {
         let mut it = p.make_track_item(matte, TrackKind::Video, r.tick_of(at), TimeRange::new(r.tick_of(at), r.tick_of(2)), r).unwrap();
@@ -325,7 +325,9 @@ fn enter_renders_the_red_segment_and_leaves_the_yellow_one() {
         it.effects.extend(fx.iter().map(|f| find_effect(f).unwrap().instance()));
         it
     };
-    let red = clip(&mut p, 0, &["gaussian_blur", "sharpen", "lumetri", "noise"]);
+    // (effects without a GPU version: this fork's estimate asks the frame planner, and four heavy
+    // effects the effect stage runs are yellow)
+    let red = clip(&mut p, 0, &["twirl", "wave_warp", "median", "four_color_gradient"]);
     let yellow = clip(&mut p, 2, &["tint"]);
     p.sequence_mut(seq).unwrap().video_tracks[0].items = vec![red, yellow];
     s.project = Arc::new(p);

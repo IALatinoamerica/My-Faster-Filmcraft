@@ -111,3 +111,33 @@ Checks run: `cargo fmt`; clippy with warnings as errors on `filmcraft-render`, `
 (905 pass, 1 fails: `every_builtin_preset_exports_and_ffprobe_confirms`, at "APV 422-10"; it
 fails the same way without this stage's changes, the local `ffprobe` does not report that codec).
 Not run: `cargo xtask ci`.
+
+## Round 3, stage 3: the render bar asks the planner
+
+`FULL TEST 02.fcproj`, sequence `EDIT_PR_282 News Nov 02` (328 segments), read with
+`sequence.renderBar` on 2026-11-15:
+
+| | Before | After |
+|---|---|---|
+| Red segments | 129 (342.1 s) | 6 (0.7 s) |
+| Yellow segments | 199 (1015.4 s) | 322 (1356.8 s) |
+| Time to compute the bar (`render_bar_timing`, ignored test) | 5.72 ms | 7.27 ms |
+
+The six red segments left are three short transitions (26.5 ms estimated against a 25 ms budget).
+The benchmark of round 2 showed 528 frames or more of 600 in every 10 s window of this sequence,
+so "yellow almost everywhere" agrees with it.
+
+In the running app (control channel, a copy of `FX Twirl ADJ.fcproj`): `sequence.cpuReport`
+answered with `"device": "actual"` and listed the Twirl adjustment layer (whole frame) and one
+title, and the bar over that layer was red. The tooltip on the bar was not looked at on screen;
+its text is covered by a test.
+
+A list window (`Sequence ▸ CPU Report…`) was built, seen working, and removed at Bruno's
+decision: the bar is the warning.
+
+Checks run: `cargo fmt`; clippy with warnings as errors on `filmcraft-render`, `filmcraft-gpu`,
+`filmcraft-engine` and `filmcraft-ui-egui`; tests of `filmcraft-render` (290 pass),
+`filmcraft-gpu` (64 pass), `filmcraft-engine --lib` (905 pass, the APV export test fails as
+before) and `filmcraft-ui-egui --lib` (359 pass). After the window was removed only clippy and
+the `filmcraft-ui-egui` tests were run again. Not run: `cargo xtask ci`; the benchmark was not
+repeated after this stage (the change runs only when the project changes, not during playback).

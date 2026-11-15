@@ -191,7 +191,10 @@ fn need_classification_none_yellow_red() {
     let b = place(&mut p, seq, 0, matte, 24, 24);
     let c = place(&mut p, seq, 0, matte, 48, 24);
     add_fx(&mut p, seq, b, "tint");
-    for fx in ["gaussian_blur", "sharpen", "lumetri", "noise"] {
+    // (effects without a GPU version: the CPU renders this layer. The estimate asks the planner,
+    // so four heavy effects the effect stage runs would be yellow: see
+    // `the_estimate_follows_the_planner`)
+    for fx in ["twirl", "wave_warp", "median", "four_color_gradient"] {
         add_fx(&mut p, seq, c, fx);
     }
     let s = video_segments(&p, seq);
@@ -318,4 +321,129 @@ fn a_subclip_that_is_its_own_parent_does_not_recurse_forever() {
     }
     let s = std::thread::Builder::new().stack_size(256 << 10).spawn(move || video_segments(&p, seq).len()).unwrap().join().unwrap();
     assert_eq!(s, 1);
+}
+
+/// The render bar asks the frame planner which path each layer takes: effects the effect stage
+/// runs are cheap, on clips and on adjustment layers (also one moved off centre, or with a masked
+/// effect), an effect without a GPU version costs its CPU figure, and an adjustment layer the GPU
+/// can't run makes the segment red whatever the sum. At 60 fps, as on Bruno's timeline.
+#[test]
+fn the_estimate_follows_the_planner() {
+    let r = FrameRate::FPS_60;
+    let build = |clip_fx: &[&str], adj_fx: &[&str], change: &dyn Fn(&mut filmcraft_project::TrackItem, &mut filmcraft_project::TrackItem)| {
+        let mut p = Project::new("r");
+        let matte = add_gen(&mut p, GeneratorSource::new(Generator::ColorMatte { color: [1.0, 0.0, 0.0, 1.0] }, 1920, 1080, r, Tick(60 * TICKS_PER_SECOND)));
+        let seq = p.new_sequence("s", SequenceSettings { width: 1920, height: 1080, frame_rate: r, ..Default::default() }, 2, 0, None);
+        let adj =
+            p.add_item("Adjustment Layer", Label::Lavender, ItemKind::AdjustmentLayer { width: 1920, height: 1080, rate: r, duration: r.tick_of(600) }, None);
+        let mut items = Vec::new();
+        for (track, (item, effects)) in [(matte, clip_fx), (adj, adj_fx)].into_iter().enumerate() {
+            let mut ti = p.make_track_item(item, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, r.tick_of(60)), r).unwrap();
+            for id in effects {
+                ti.effects.insert(0, find_effect(id).unwrap().instance());
+            }
+            for e in ti.effects.iter_mut() {
+                filmcraft_project::resolve_auto_points(e, (1920, 1080), (1920, 1080));
+            }
+            items.push((track, ti));
+        }
+        let (mut a, mut b) = (items.remove(0).1, items.remove(0).1);
+        change(&mut a, &mut b);
+        let q = p.sequence_mut(seq).unwrap();
+        q.video_tracks[0].items.push(a);
+        if !adj_fx.is_empty() {
+            q.video_tracks[1].items.push(b);
+        }
+        let s = video_segments(&p, seq);
+        (s[0].need, s[0].cost_ms)
+    };
+    fn grade(it: &mut filmcraft_project::TrackItem) {
+        let e = it.effect_mut("lumetri").unwrap();
+        e.params.get_mut("hsl_on").unwrap().value = ParamValue::Bool(true);
+        e.params.get_mut("sharpen").unwrap().value = ParamValue::Float(40.0);
+    }
+    let nothing = |_: &mut filmcraft_project::TrackItem, _: &mut filmcraft_project::TrackItem| {};
+    // (what, effects on the clip, effects on the adjustment layer, a change, the colour)
+    type Change<'a> = &'a dyn Fn(&mut filmcraft_project::TrackItem, &mut filmcraft_project::TrackItem);
+    let cases: Vec<(&str, &[&str], &[&str], Change, Need)> = vec![
+        ("four effects the effect stage runs", &["gaussian_blur", "sharpen", "lumetri", "noise"], &[], &nothing, Need::Realtime),
+        ("an adjustment layer with effects the effect stage runs", &[], &["invert", "gaussian_blur"], &nothing, Need::Realtime),
+        (
+            "the same layer moved off centre",
+            &[],
+            &["invert", "gaussian_blur"],
+            &|_, adj| adj.effect_mut("motion").unwrap().params.get_mut("position").unwrap().value = ParamValue::Vec2(filmcraft_geom::Vec2::new(960.0, 550.0)),
+            Need::Realtime,
+        ),
+        (
+            "the same layer with a mask on an effect",
+            &[],
+            &["invert", "gaussian_blur"],
+            &|_, adj| {
+                adj.effect_mut("invert").unwrap().masks.push(filmcraft_project::Mask::new("m", filmcraft_project::MaskPath::rect(100.0, 100.0, 900.0, 700.0)))
+            },
+            Need::Realtime,
+        ),
+        ("a Color Grading with every section, on the adjustment layer", &[], &["lumetri"], &|_, adj| grade(adj), Need::Realtime),
+        (
+            "two such Color Gradings on one frame",
+            &["lumetri"],
+            &["lumetri"],
+            &|clip, adj| {
+                grade(clip);
+                grade(adj);
+            },
+            Need::Render,
+        ),
+        ("an effect without a GPU version on the clip", &["twirl"], &[], &nothing, Need::Render),
+        ("an effect without a GPU version on the adjustment layer", &[], &["twirl"], &nothing, Need::Render),
+        (
+            "a cheap effect on an adjustment layer the GPU can't run (Multiply)",
+            &[],
+            &["invert"],
+            &|_, adj| {
+                let multiply = filmcraft_project::effect::BLEND_MODES.iter().position(|b| *b == "Multiply").unwrap() as u32;
+                adj.effect_mut("opacity").unwrap().params.get_mut("blend").unwrap().value = ParamValue::Choice(multiply);
+            },
+            Need::Render,
+        ),
+    ];
+    for (what, clip_fx, adj_fx, change, want) in cases {
+        let (need, cost) = build(clip_fx, adj_fx, change);
+        assert_eq!(need, want, "{what}: {cost} ms");
+    }
+    // the whole-frame case is red although its sum is under the budget (25 ms at 60 fps)
+    let (need, cost) = build(&[], &["crop"], cases_multiply());
+    assert!(need == Need::Render && cost < 25.0, "{cost} ms");
+}
+
+fn cases_multiply() -> &'static dyn Fn(&mut filmcraft_project::TrackItem, &mut filmcraft_project::TrackItem) {
+    &|_, adj| {
+        let multiply = filmcraft_project::effect::BLEND_MODES.iter().position(|b| *b == "Multiply").unwrap() as u32;
+        adj.effect_mut("opacity").unwrap().params.get_mut("blend").unwrap().value = ParamValue::Choice(multiply);
+    }
+}
+
+/// How long the render bar's segments take to compute for a real project (the planner is asked
+/// about every layer of every segment, on the interface thread, each time the project changes).
+/// `FILMCRAFT_BAR_PROJECT=<file.fcproj> cargo test -p filmcraft-render --release -- --ignored
+/// render_bar_timing --nocapture` prints the time per sequence.
+#[test]
+#[ignore = "needs a project file: FILMCRAFT_BAR_PROJECT"]
+fn render_bar_timing() {
+    let Ok(path) = std::env::var("FILMCRAFT_BAR_PROJECT") else { return };
+    let text = std::fs::read_to_string(&path).unwrap();
+    let file: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let p = Project::from_json(&file["project"].to_string()).unwrap();
+    for item in p.items.values() {
+        if !matches!(item.kind, ItemKind::Sequence(_)) {
+            continue;
+        }
+        let t0 = std::time::Instant::now();
+        let mut n = 0;
+        for _ in 0..20 {
+            n = video_segments(&p, item.id).len();
+        }
+        println!("{:?}: {n} segments, {:.2} ms per computation", item.name, t0.elapsed().as_secs_f64() * 1000.0 / 20.0);
+    }
 }

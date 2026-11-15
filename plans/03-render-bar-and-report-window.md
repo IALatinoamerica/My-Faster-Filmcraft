@@ -1,4 +1,4 @@
-# Stage 3: the render bar asks the planner, and the report is shown in the interface
+# Stage 3: the render bar asks the planner, and says why a stretch is red
 
 Decided by Bruno on 2026-11-15: the coloured bar above the timeline is the automatic warning.
 It replaces the earlier idea of a separate mark on the Program Monitor.
@@ -68,18 +68,11 @@ The bar's tooltip keeps its sentence and, on a red segment, adds the reasons fro
 that stretch: clip name, track and reason, at most three lines and "…and N more". Computed when
 the pointer rests on the bar, not while drawing it.
 
-### C. The list, as a window
+### C. No window
 
-`Sequence ▸ CPU Report…` runs the stage 2 command for the active sequence and opens a window:
-
-- a first line: "Nothing in this sequence renders on the CPU." or "N clips render on the CPU; M
-  of them take the whole frame.";
-- one row per entry, whole-frame entries first: track, clip name, start timecode, duration,
-  reason; a click moves the playhead there and selects the clip;
-- a Refresh button; the list is computed when the window opens and on Refresh.
-
-The bar is 2 pixels high and its tooltip needs a steady pointer; the window is the readable
-form of the same information. Part C is independent of A and B and can be dropped or done later.
+A list window opened from `Sequence ▸ CPU Report…` was built and then removed on 2026-11-15, at
+Bruno's decision: the warning is the bar on the timeline, nothing else. Agents read the full list
+with `sequence.cpuReport` (stage 2).
 
 ### Rules of this codebase that apply (AGENTS.md §3.2)
 

@@ -76,12 +76,15 @@ are in the Git history). In short:
 | Sources fetched side by side | The clips of one frame are decoded at the same time. | `prefetch_sources`, `media_requests` in `plan.rs`; the call in `crates/ui-egui/src/frames.rs` |
 | No read-back of pictures nobody shows | After a jump, the hardware decoder does not copy back pictures before the wanted one. | `set_output_from` in `crates/codecs/src/video.rs`; `RETURN_BEFORE` in `crates/codecs/src/gop.rs`; `crates/platform/src/vaapi/{h264,hevc}.rs`, `vaapi.rs`, `hybrid.rs` |
 | Benchmark | `--project`, `--sequence`, `--start`, scenarios `project` and `project-seek`. | `crates/ui-egui/examples/bench/playback.rs` |
+| Effects limited by a mask of their own on the GPU | A masked effect no longer sends its clip's layer, or the whole frame under an adjustment layer, to the CPU. | `FxOp::Masked` in `crates/render/src/gpufx.rs`; `masked_op`, `mask_plane`, `has_masks` in `crates/render/src/plan.rs`; `masked_steps`, `Step::mask_begin` / `mask_mix` and the kept picture (`kept`) in `crates/gpu/src/fx.rs` (it reuses `OP_MIX_BASE`, no new op code) |
+| Report of what renders on the CPU | `sequence.cpuReport` lists, without decoding, the clips, adjustment layers and transitions the GPU does not draw, with track, time and reason. Bruno's agents use it. | `crates/render/src/slow_paths.rs` (ours entirely); `adjustment_fx`, `AdjustmentCpu`, `adjustment_cx`, `transition_cpu`, `note_device`, `noted_device` in `plan.rs`; `cpu_report_json` in `crates/engine/src/previews.rs` and its `query!` line in `crates/engine/src/commands.rs`; the `note_device` call in `crates/ui-egui/src/panels/monitor.rs`; `docs/control-protocol.md` |
+| Render bar that asks the planner | The red / yellow bar above the timeline (and what `Render Effects In to Out` renders) follows what this fork really sends to the CPU; upstream's estimate assumes every effect and adjustment layer is on the CPU. A red stretch's tooltip names the clip and the reason. | `gpu_fx_cost`, `gpu_layer_cost`, `cpu_layer_cost`, `layer_cost`, `estimate_cost`, `GPU_EFFECT_MS`, `GPU_GRADE_MS` in `crates/render/src/preview.rs`; `is_full_grade` in `slow_paths.rs`; `crates/ui-egui/src/cpu_report.rs` and its call in `crates/ui-egui/src/panels/timeline/ruler.rs`; one row at the end of `crates/ui-egui/src/i18n/es.tsv` |
 | Update notice that cannot install | A newer release shows in our own notice, whose "Update and Restart" button is always greyed out; upstream's prompt, which installs the official build over the fork, never opens. If upstream reworks `updates_ui.rs`, keep this: no check may hand a found release to the library's `Updater`. | `fork_updater`, `fork_notice`, `Found` and the test `a_found_release_shows_the_fork_notice_and_not_the_installing_prompt` in `crates/ui-egui/src/updates_ui.rs`; three rows at the end of `crates/ui-egui/src/i18n/es.tsv` |
 | App icon | A gold owl, so the fork is told apart from the installed FilmCraft. | `assets/app-icon/hicolor/*/apps/ai.storyteller.filmcraft.png` |
 
 Each optimization has tests that compare it with the CPU renderer or count the work done. They
 are part of the optimization: keep them, and fix them when upstream changes something they use.
-Three upstream tests were changed on purpose, because they asserted the old slow behaviour:
+Five upstream tests were changed on purpose, because they asserted the old slow behaviour:
 
 - `transform_with_its_own_shutter_angle_runs_on_the_gpu_unless_it_shrinks` in `gpufx.rs`;
 - `an_adjustment_layer_the_gpu_cant_run_plans_the_frame_on_the_cpu` in
@@ -89,13 +92,17 @@ Three upstream tests were changed on purpose, because they asserted the old slow
   is Twirl instead of Emboss, and its "opacity 50 %" and "Motion at 50 %" cases are gone (they run
   on the GPU now);
 - `lumetri_unsupported_sections_fall_back` in `crates/gpu/src/fx_tests.rs`: only HDR and a Denoise
-  window over 3 pixels still fall back.
+  window over 3 pixels still fall back;
+- `need_classification_none_yellow_red` in `crates/render/src/preview_tests.rs` and
+  `enter_renders_the_red_segment_and_leaves_the_yellow_one` in
+  `crates/engine/src/previews_tests.rs`: their red clip has four effects without a GPU version
+  (four heavy effects the GPU runs are yellow here).
 
 If upstream edits those tests, keep our expectation.
 
-What still renders on the CPU, by decision: an effect with a mask of its own, blend modes other
-than Normal on an adjustment layer, HDR sequences, and effects with no GPU version (Twirl and
-others). An effect upstream adds later has no GPU version here until one is written.
+What still renders on the CPU, by decision: blend modes other than Normal on an adjustment
+layer, HDR sequences, titles and nested sequences with effects, and effects with no GPU version
+(Twirl and others). `sequence.cpuReport` and the render bar name them. An effect upstream adds later has no GPU version here until one is written.
 
 A mistake in `fx.wgsl` (even a reserved word used as a name) makes the whole effect stage fail
 to start, and every effect then renders on the CPU without any error on screen. The GPU tests in

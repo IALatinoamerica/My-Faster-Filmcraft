@@ -990,6 +990,7 @@ pub fn cpu_report_json(s: &Session, p: &Value) -> Result<Value> {
             "endTimecode": tc(e.end),
             "reason": e.reason,
             "wholeFrame": e.whole_frame,
+            "clip": e.clip.map(|c| c.0),
         })).collect::<Vec<_>>(),
     }))
 }

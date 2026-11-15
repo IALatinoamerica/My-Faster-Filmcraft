@@ -3758,3 +3758,4 @@
 	This copy is a fork with its own optimizations. Installing the original update would replace it, so it is updated from the fork's folder instead (UPDATING.md).	Esta copia es un fork con optimizaciones propias. Instalar la actualización original la reemplazaría, así que se actualiza desde la carpeta del fork (UPDATING.md).
 	Update and Restart	Actualizar y reiniciar
 	Later	Más tarde
+	…and {n} more	…y {n} más

@@ -1,6 +1,6 @@
 # Round 3: masked effects on the GPU, and a report of what renders on the CPU
 
-Decided by Bruno on 2026-11-15. Not started. Rounds 1 and 2 are implemented; their plans were
+Decided by Bruno on 2026-11-15. Implemented the same day (results in [results.md](results.md)). Rounds 1 and 2 are implemented; their plans were
 removed (they are in the Git history, last in commit `5efbb67f`) and their numbers stay in
 [results.md](results.md).
 
@@ -30,7 +30,7 @@ copied: each stage is written for this fork's code.
 |---|---|---|
 | [01](01-masked-effects.md) | Effects limited by a mask of their own, on media clips and on adjustment layers | A mask on Color Grading (or any GPU effect) no longer slows playback |
 | [02](02-cpu-report.md) | The report: a function in `crates/render` and a command | An agent can ask "what renders on the CPU in this sequence?" and get a list |
-| [03](03-render-bar-and-report-window.md) | The render bar asks the planner; the report in the interface | The red / yellow bar above the timeline tells the truth about this fork, says why a stretch is red, and Bruno can open the list and jump to each clip |
+| [03](03-render-bar-and-report-window.md) | The render bar asks the planner | The red / yellow bar above the timeline tells the truth about this fork and says why a stretch is red |
 
 Stage 1 goes first so that the report is written once, against the final coverage.
 

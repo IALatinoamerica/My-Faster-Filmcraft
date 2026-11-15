@@ -40,6 +40,8 @@ pub struct SlowPath {
     pub reason: String,
     /// Every frame of this part renders entirely on the CPU, not just this layer.
     pub whole_frame: bool,
+    /// The clip, when the entry is one (not a transition or the sequence).
+    pub clip: Option<filmcraft_project::ClipId>,
 }
 
 /// What renders on the CPU in sequence `seq_id` between `start` and `end` (timeline ticks) on a
@@ -51,7 +53,7 @@ pub fn slow_paths(project: &Project, seq_id: ItemId, start: Tick, end: Tick, cap
         return out;
     }
     if let Some(reason) = sequence_reason(seq) {
-        out.push(SlowPath { track: 0, name: "Sequence".into(), start, end, reason: reason.into(), whole_frame: true });
+        out.push(SlowPath { track: 0, name: "Sequence".into(), start, end, reason: reason.into(), whole_frame: true, clip: None });
         return out;
     }
     'tracks: for (index, track) in seq.video_tracks.iter().enumerate().filter(|(_, track)| track.enabled) {
@@ -62,7 +64,7 @@ pub fn slow_paths(project: &Project, seq_id: ItemId, start: Tick, end: Tick, cap
                 && let Some(reason) = crate::plan::transition_cpu(project, track, trn)
             {
                 let reason = format!("{reason}: its frames render on the CPU");
-                out.push(SlowPath { track: index + 1, name: trn.effect.effect.clone(), start: a, end: b, reason, whole_frame: true });
+                out.push(SlowPath { track: index + 1, name: trn.effect.effect.clone(), start: a, end: b, reason, whole_frame: true, clip: None });
             }
         }
         for item in track.items.iter().filter(|item| item.enabled) {
@@ -71,7 +73,7 @@ pub fn slow_paths(project: &Project, seq_id: ItemId, start: Tick, end: Tick, cap
                 continue;
             }
             for (reason, whole_frame) in item_reasons(project, seq, item, a, b, caps) {
-                out.push(SlowPath { track: index + 1, name: item.name.clone(), start: a, end: b, reason, whole_frame });
+                out.push(SlowPath { track: index + 1, name: item.name.clone(), start: a, end: b, reason, whole_frame, clip: Some(item.id) });
             }
             if out.len() > MAX_ENTRIES {
                 break 'tracks;
@@ -82,7 +84,7 @@ pub fn slow_paths(project: &Project, seq_id: ItemId, start: Tick, end: Tick, cap
     if out.len() > MAX_ENTRIES {
         out.truncate(MAX_ENTRIES);
         let reason = format!("the list was cut at {MAX_ENTRIES} entries");
-        out.push(SlowPath { track: 0, name: "…".into(), start, end, reason, whole_frame: false });
+        out.push(SlowPath { track: 0, name: "…".into(), start, end, reason, whole_frame: false, clip: None });
     }
     out
 }
@@ -146,6 +148,38 @@ fn adjustment_reason(project: &Project, seq: &Sequence, item: &TrackItem, t: Tic
     Some(format!("adjustment layer: {why}, {tail}"))
 }
 
+/// The effect context a media clip's effects are asked about with: its stored size's scale.
+fn media_cx<'a>(project: &'a Project, seq: &Sequence, item: &'a TrackItem, t: Tick) -> crate::effects::FxCtx<'a> {
+    crate::effects::FxCtx {
+        t: item.effect_time_at(t),
+        px_scale: 1.0,
+        mask_scale: 1.0,
+        seconds: (t - item.start).seconds(),
+        timecode: "",
+        clip_name: &item.name,
+        project: Some(project),
+        env: None,
+        frame_rate: seq.settings.frame_rate.as_f64(),
+        working: seq.settings.color.working,
+    }
+}
+
+/// The size effects of `item` are asked about for: the output's for an adjustment layer, else
+/// the stored size of its source.
+fn effect_size(project: &Project, seq: &Sequence, item: &TrackItem) -> (usize, usize) {
+    let own =
+        if matches!(project.item(item.item).map(|p| &p.kind), Some(ItemKind::AdjustmentLayer { .. })) { None } else { crate::source_size(project, item.item) };
+    let size = own.unwrap_or((seq.settings.width, seq.settings.height));
+    (size.0.max(1) as usize, size.1.max(1) as usize)
+}
+
+/// Whether the Color Grading `e` of `item` evaluates to a sequence of passes at `t` (more than
+/// its Basic, Creative and Vignette controls in use): the render bar counts it as a heavy effect.
+pub(crate) fn is_full_grade(project: &Project, seq: &Sequence, item: &TrackItem, e: &EffectInstance, t: Tick) -> bool {
+    let (w, h) = effect_size(project, seq, item);
+    matches!(FxOp::eval(e, &media_cx(project, seq, item, t), w, h), Some(FxOp::Seq(_)))
+}
+
 fn media_reason(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick) -> Option<String> {
     let standard = || item.effects.iter().filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e));
     let Some(chain) = crate::plan::gpu_chain(project, item, RenderOptions::default()) else {
@@ -154,20 +188,8 @@ fn media_reason(project: &Project, seq: &Sequence, item: &TrackItem, t: Tick) ->
         return Some(format!("{what} has no GPU version: this clip renders on the CPU"));
     };
     if !chain.is_empty() {
-        let size = crate::source_size(project, item.item).unwrap_or((seq.settings.width, seq.settings.height));
-        let (w, h) = (size.0.max(1) as usize, size.1.max(1) as usize);
-        let cx = crate::effects::FxCtx {
-            t: item.effect_time_at(t),
-            px_scale: 1.0,
-            mask_scale: 1.0,
-            seconds: (t - item.start).seconds(),
-            timecode: "",
-            clip_name: &item.name,
-            project: Some(project),
-            env: None,
-            frame_rate: seq.settings.frame_rate.as_f64(),
-            working: seq.settings.color.working,
-        };
+        let (w, h) = effect_size(project, seq, item);
+        let cx = media_cx(project, seq, item, t);
         if let Some(e) = chain.iter().find(|e| FxOp::eval(e, &cx, w, h).filter(FxOp::gpu_ok).is_none()) {
             return Some(format!("effect \"{}\" cannot run on the GPU with these settings: this clip renders on the CPU", effect_name(e)));
         }

@@ -180,7 +180,7 @@ the result's `sourceInClamped: [ids]` (present with `keepSourceIn`) names the cl
 sequence (the active one by default; `start` / `end` in ticks, the whole sequence by default) that
 the GPU compositor does not draw, without decoding anything: `{sequence, start, end, device,
 count, wholeFrameCount, entries: [{track, name, start, end, startTimecode, endTimecode, reason,
-wholeFrame}]}`. `track` counts video tracks from 1 at the bottom (0: the sequence itself);
+wholeFrame, clip}]}` (`clip`: the clip's id, null for a transition or the sequence). `track` counts video tracks from 1 at the bottom (0: the sequence itself);
 `wholeFrame` says every frame of that part renders on the CPU, not just that layer. `device` is
 `actual` when the monitors have composited a frame (the report asks about that device) and
 `assumed` in a session that has not (it then assumes a device that runs every step). An empty

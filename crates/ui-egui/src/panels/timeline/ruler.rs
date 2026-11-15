@@ -153,8 +153,14 @@ pub(super) fn draw_top(app: &mut FilmcraftApp, ui: &mut egui::Ui, rect: Rect, se
         let hit = r.expand2(vec2(0.0, 2.0));
         app.auto.add(&format!("timeline.renderBar.{i}"), hit, what);
         if ui.rect_contains_pointer(hit) {
+            // fork: a red stretch also says what renders on the CPU there, and why
+            let why =
+                if span.state == BarState::Red { crate::cpu_report::reasons(app, seq_id, TimeRange::from_bounds(span.start, span.end)) } else { Vec::new() };
             egui::Tooltip::always_open(ui.ctx().clone(), ui.layer_id(), egui::Id::unique(("rb", i)), egui::PopupAnchor::Pointer).show(|ui| {
                 ui.label(what);
+                for line in &why {
+                    ui.label(line);
+                }
             });
         }
     }

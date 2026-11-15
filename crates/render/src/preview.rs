@@ -22,18 +22,23 @@
 //!
 //! # Cost estimate (yellow vs red)
 //! [`Segment::cost_ms`] estimates the milliseconds one frame takes on the playback path, at full
-//! sequence resolution, as the sum over visible layers of:
+//! sequence resolution. Which path each layer takes is the frame planner's decision, asked through
+//! [`crate::slow_paths`] at the segment's first, middle and last tick (this fork: the estimate
+//! used to assume that any standard effect and any adjustment layer rendered on the CPU). The sum
+//! over visible layers of:
 //! * **decode**: per source codec at 1080p — H.264 3 ms, HEVC 6 ms, ProRes 2.5 ms, MJPEG 4 ms,
 //!   other files 4 ms, stills/generators 1 ms — scaled by source pixels / 1080p pixels;
-//! * **CPU layer path**: a layer with standard effects or a non-Normal blend mode leaves the GPU
-//!   fast path and pays 10 ms (1080p) for linear conversion, transform and compositing;
-//! * **effects**: per enabled standard effect, a measured tier cost at 1080p (6 / 20 / 50 ms, see
-//!   [`effect_cost_ms`]), scaled by sequence pixels / 1080p pixels;
-//! * **transitions**: dissolves/dips 1 ms (GPU), any other transition renders both sides on the
-//!   CPU: 12 ms plus the CPU path of both layers;
-//! * **adjustment layers**: whole-frame CPU render (10 ms) plus their effects.
+//! * **a layer the GPU draws**: 0.5 ms, plus 1 ms per standard effect on the effect stage
+//!   (10 ms for a Color Grading beyond its Basic, Creative and Vignette controls), scaled by
+//!   sequence pixels / 1080p pixels and counted against one frame duration, not the budget's 1.5; an adjustment layer the GPU runs costs its effects alone;
+//! * **a layer the CPU renders**: 10 ms (1080p) for linear conversion, transform and compositing,
+//!   plus per enabled standard effect a measured tier cost at 1080p (6 / 20 / 50 ms, see
+//!   [`effect_cost_ms`]), scaled the same way;
+//! * **transitions**: the ones the compositor mixes 1 ms; any other renders both sides on the
+//!   CPU: 12 ms plus the CPU path of both layers.
 //!
-//! A segment is **red** when the estimate exceeds [`REALTIME_BUDGET`] × the frame duration,
+//! A segment is **red** when something in it sends the whole frame to the CPU (an adjustment
+//! layer or transition the GPU can't run, an HDR sequence) or when the estimate exceeds [`REALTIME_BUDGET`] × the frame duration,
 //! **yellow** when it plays in real time but is not "native", and has **no bar** when it is a single
 //! clip with no standard effects, untouched Motion/Opacity, normal speed, and a source whose frame
 //! size and rate match the sequence. Green (a valid preview exists) is decided by the preview
@@ -193,9 +198,9 @@ pub fn video_segments(project: &Project, seq_id: ItemId) -> Vec<Segment> {
         if absolute {
             h.json(&("absolute", fa));
         }
-        let cost_ms = estimate_cost(project, seq, &layers);
+        let (cost_ms, whole_frame_on_cpu) = estimate_cost(project, seq, &layers, (t, rate.tick_of(fb)));
         let budget = rate.frame_duration().seconds() * 1000.0 * REALTIME_BUDGET;
-        let need = if cost_ms > budget {
+        let need = if whole_frame_on_cpu || cost_ms > budget {
             Need::Render
         } else if layers.len() == 1 && matches!(layers[0], Layer::Item(_, it) if native(project, seq, it)) {
             Need::None
@@ -489,36 +494,102 @@ fn item_fx_cost(it: &TrackItem, px: f64) -> f64 {
     it.effects.iter().filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)).map(|e| effect_cost_ms(&e.effect) * px).sum()
 }
 
-fn cpu_layer(project: &Project, it: &TrackItem) -> bool {
-    let fx = it.effects.iter().any(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic)) || it.has_opacity_masks();
-    let blend = crate::opacity_blend(it, it.source_in).1 != crate::Blend::Normal;
-    let nested = project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::Sequence(_)));
-    fx || blend || nested
+/// Cost of a standard effect the GPU's effect stage runs, on a 1080p frame, in ms.
+const GPU_EFFECT_MS: f64 = 1.0;
+/// Cost of a Color Grading that uses more than its Basic, Creative and Vignette controls (a
+/// sequence of passes on the effect stage). Measured on `FX Color Grading CAM/ADJ.fcproj` at
+/// 1080p (RX 6700 XT): the GPU pass of a frame takes about 12 ms with one, 2 ms without.
+const GPU_GRADE_MS: f64 = 10.0;
+
+/// The cost of the enabled standard effects of `it` when the effect stage runs them. The budget
+/// allows [`REALTIME_BUDGET`] frame durations because frames are rendered by jobs that run side
+/// by side; the passes of the effect stage run one after another on one device, so their time is
+/// counted against a single frame duration (scaled up by the same factor here).
+fn gpu_fx_cost(project: &Project, seq: &Sequence, it: &TrackItem, t: Tick, px: f64) -> f64 {
+    it.effects
+        .iter()
+        .filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic))
+        .map(|e| if e.effect == "lumetri" && crate::slow_paths::is_full_grade(project, seq, it, e, t) { GPU_GRADE_MS * px } else { GPU_EFFECT_MS * px })
+        .sum::<f64>()
+        * REALTIME_BUDGET
 }
 
-fn layer_cost(project: &Project, it: &TrackItem, px: f64, force_cpu: bool) -> f64 {
+/// The cost of a layer the CPU renders: its decode, the CPU layer path and its effects at their
+/// CPU cost. An adjustment layer decodes nothing and renders the whole frame.
+fn cpu_layer_cost(project: &Project, it: &TrackItem, px: f64) -> f64 {
     if project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::AdjustmentLayer { .. })) {
         return 10.0 * px + item_fx_cost(it, px);
     }
-    let decode = decode_cost_ms(project, it.item, 0);
-    let path = if force_cpu || cpu_layer(project, it) { 10.0 * px } else { 0.5 };
-    decode + path + item_fx_cost(it, px)
+    decode_cost_ms(project, it.item, 0) + 10.0 * px + item_fx_cost(it, px)
 }
 
-fn estimate_cost(project: &Project, seq: &Sequence, layers: &[Layer]) -> f64 {
-    let px = (seq.settings.width as f64 * seq.settings.height as f64) / HD_PIXELS;
-    let mut total = 0.0;
-    for l in layers {
-        total += match l {
-            Layer::Item(_, it) => layer_cost(project, it, px, false),
-            Layer::Transition(_, x, a, b) => {
-                let simple = matches!(x.effect.effect.as_str(), "cross_dissolve" | "dip_to_black" | "dip_to_white" | "non_additive_dissolve");
-                let sides: f64 = [a, b].iter().filter_map(|s| s.map(|it| layer_cost(project, it, px, !simple))).sum();
-                sides + if simple { 1.0 } else { 12.0 * px }
-            }
-        };
+/// The cost of a layer the GPU draws at `t`: its decode, the compositor and its effects on the
+/// effect stage. A nested sequence the compositor draws as layers costs what its own layers do.
+fn gpu_layer_cost(project: &Project, seq: &Sequence, it: &TrackItem, t: Tick, px: f64, depth: u32) -> f64 {
+    match project.item(it.item).map(|p| &p.kind) {
+        Some(ItemKind::AdjustmentLayer { .. }) => gpu_fx_cost(project, seq, it, t, px),
+        Some(ItemKind::Sequence(nested)) if depth < crate::MAX_NEST_DEPTH => {
+            let ft = it.source_time_at(t);
+            let angle = it.multicam_angle(nested).and_then(|a| nested.angle_video_track_index(a));
+            let inner = nested
+                .video_tracks
+                .iter()
+                .enumerate()
+                .filter(|(i, tr)| tr.enabled && angle.is_none_or(|a| a == *i))
+                .filter_map(|(_, tr)| tr.item_at(ft).filter(|i| i.enabled))
+                .map(|i| gpu_layer_cost(project, nested, i, ft, px, depth + 1))
+                .sum::<f64>();
+            0.5 + inner
+        }
+        _ => decode_cost_ms(project, it.item, 0) + 0.5 + gpu_fx_cost(project, seq, it, t, px),
     }
-    total
+}
+
+/// The cost of the layer of `it` over the segment from `a` to `b`, and whether it sends every
+/// frame of the segment to the CPU. The planner decides which path the layer takes
+/// ([`crate::slow_paths::item_reason`], asked at the segment's first, middle and last tick): the
+/// table of CPU effect costs counts only for a layer the CPU really renders.
+fn layer_cost(project: &Project, seq: &Sequence, it: &TrackItem, (a, b): (Tick, Tick), px: f64, caps: crate::plan::DeviceCaps) -> (f64, bool) {
+    let mut cpu: Option<bool> = None;
+    for t in crate::slow_paths::samples(a, b) {
+        if let Some((_, whole)) = crate::slow_paths::item_reason(project, seq, it, t, caps, 0) {
+            cpu = Some(cpu.unwrap_or(false) || whole);
+        }
+    }
+    match cpu {
+        Some(whole) => (cpu_layer_cost(project, it, px), whole),
+        None => (gpu_layer_cost(project, seq, it, a, px, 0), false),
+    }
+}
+
+/// The estimated cost of one frame of the segment from `a` to `b`, and whether something in it
+/// sends the whole frame to the CPU (the segment is then red whatever the sum).
+fn estimate_cost(project: &Project, seq: &Sequence, layers: &[Layer], span: (Tick, Tick)) -> (f64, bool) {
+    let px = (seq.settings.width as f64 * seq.settings.height as f64) / HD_PIXELS;
+    // the device that composites the monitors; before it is known, one that runs every step
+    let caps = crate::plan::noted_device().unwrap_or(crate::plan::DeviceCaps::ALL);
+    let mut total = 0.0;
+    let mut whole = crate::slow_paths::sequence_reason(seq).is_some();
+    for l in layers {
+        match l {
+            Layer::Item(_, it) => {
+                let (cost, cpu) = layer_cost(project, seq, it, span, px, caps);
+                total += cost;
+                whole |= cpu;
+            }
+            Layer::Transition(ti, x, a, b) => {
+                let on_cpu = seq.video_tracks.get(*ti).is_some_and(|tr| crate::plan::transition_cpu(project, tr, x).is_some());
+                for it in [a, b].into_iter().flatten() {
+                    let (cost, cpu) = layer_cost(project, seq, it, span, px, caps);
+                    total += if on_cpu { cpu_layer_cost(project, it, px) } else { cost };
+                    whole |= cpu;
+                }
+                total += if on_cpu { 12.0 * px } else { 1.0 };
+                whole |= on_cpu;
+            }
+        }
+    }
+    (total, whole)
 }
 
 /// A single clip that plays natively: no standard effects, untouched fixed effects, normal speed,

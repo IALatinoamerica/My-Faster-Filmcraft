@@ -44,6 +44,7 @@ pub mod calc;
 pub mod capture;
 mod cjk;
 pub mod control;
+pub mod cpu_report;
 pub mod crash;
 pub mod credits;
 pub mod dock;
