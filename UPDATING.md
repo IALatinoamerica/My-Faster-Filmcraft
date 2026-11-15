@@ -52,9 +52,10 @@ merge work.
 | Restore points | A tag `pre-<version>-merge` made before each update. |
 
 The app shows an "update available" notice when the `version` it was built with is older than
-the latest release. That notice is the usual reason Bruno asks for an update. Its "Download"
-button fetches the official build, which would replace the fork and lose our optimizations: it
-is never used. The update is done here instead.
+the latest release. That notice is the usual reason Bruno asks for an update. Upstream's
+notice has an "Update and Restart" button that installs the official build over the installed
+package, which would replace the fork and lose our optimizations. The fork shows its own notice
+instead, with that button greyed out (see the table below). The update is done here.
 
 ## What must survive: our optimizations
 
@@ -74,6 +75,7 @@ the measured results in `plans/results.md`. In short:
 | Sources fetched side by side | The clips of one frame are decoded at the same time. | `prefetch_sources`, `media_requests` in `plan.rs`; the call in `crates/ui-egui/src/frames.rs` |
 | No read-back of pictures nobody shows | After a jump, the hardware decoder does not copy back pictures before the wanted one. | `set_output_from` in `crates/codecs/src/video.rs`; `RETURN_BEFORE` in `crates/codecs/src/gop.rs`; `crates/platform/src/vaapi/{h264,hevc}.rs`, `vaapi.rs`, `hybrid.rs` |
 | Benchmark | `--project`, `--sequence`, `--start`, scenarios `project` and `project-seek`. | `crates/ui-egui/examples/bench/playback.rs` |
+| Update notice that cannot install | A newer release shows in our own notice, whose "Update and Restart" button is always greyed out; upstream's prompt, which installs the official build over the fork, never opens. If upstream reworks `updates_ui.rs`, keep this: no check may hand a found release to the library's `Updater`. | `fork_updater`, `fork_notice`, `Found` and the test `a_found_release_shows_the_fork_notice_and_not_the_installing_prompt` in `crates/ui-egui/src/updates_ui.rs`; three rows at the end of `crates/ui-egui/src/i18n/es.tsv` |
 | App icon | A gold owl, so the fork is told apart from the installed FilmCraft. | `assets/app-icon/hicolor/*/apps/ai.storyteller.filmcraft.png` |
 
 Each optimization has tests that compare it with the CPU renderer or count the work done. They
