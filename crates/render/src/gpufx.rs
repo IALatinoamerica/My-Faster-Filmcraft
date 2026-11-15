@@ -254,6 +254,7 @@ pub enum FxOp {
     DropShadow(crate::gpufx_more::DropShadow),
     Noise(crate::gpufx_more::Noise),
     UltraKey(crate::gpufx_more::UltraKey),
+    LensDistortion(crate::gpufx_more::LensDistortion),
 }
 
 /// Effect ids [`FxOp::eval`] understands (the GPU-capable standard effects).
@@ -300,6 +301,7 @@ pub const GPU_EFFECTS: &[&str] = &[
     "noise",
     "noise_legacy",
     "ultra_key",
+    "lens_distortion",
 ];
 
 /// Pictures a Transform with its own shutter angle is blurred over.
@@ -580,6 +582,7 @@ impl FxOp {
             "drop_shadow" => FxOp::DropShadow(crate::gpufx_more::DropShadow::eval(e, cx, w, h)),
             "noise" | "noise_legacy" => FxOp::Noise(crate::gpufx_more::Noise::eval(e, cx)),
             "ultra_key" => FxOp::UltraKey(crate::gpufx_more::UltraKey::eval(e, cx, w, h)),
+            "lens_distortion" => FxOp::LensDistortion(crate::gpufx_more::LensDistortion::eval(e, cx, w, h)),
             "horizontal_flip" => FxOp::HFlip,
             "vertical_flip" => FxOp::VFlip,
             "mirror" => {
@@ -801,6 +804,7 @@ impl FxOp {
             FxOp::DropShadow(d) => d.gpu_ok(),
             FxOp::Noise(n) => n.gpu_ok(),
             FxOp::UltraKey(k) => k.gpu_ok(),
+            FxOp::LensDistortion(l) => l.gpu_ok(),
         }
     }
 
@@ -1122,6 +1126,7 @@ impl FxOp {
             FxOp::DropShadow(d) => d.apply(img),
             FxOp::Noise(n) => n.apply(img),
             FxOp::UltraKey(k) => k.apply(img),
+            FxOp::LensDistortion(l) => l.apply(img),
             FxOp::Mask { cov } => {
                 if cov.len().checked_mul(4) == Some(img.px.len()) {
                     crate::mask::scale_by(img, cov);

@@ -68,6 +68,7 @@ const OP_KEY_MATTE: u32 = 107u;
 const OP_KEY_CHOKE: u32 = 108u;
 const OP_KEY_FINAL: u32 = 109u;
 const OP_MIX_BASE: u32 = 110u;
+const OP_LENS: u32 = 111u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -928,6 +929,16 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             let na = a * o.a;
             return vec4(l * na, na);
+        }
+        case OP_LENS: {
+            // Lens Distortion: p0 = (curvature, centre x, centre y, half diagonal)
+            // (centre + offset × (1 − k·r²), written as the pixel minus its shift: the pixel's own
+            // position is exact, so only the shift carries rounding)
+            let c = u.p0.yz;
+            let off = pc - c;
+            let d = off / u.p0.w;
+            let shift = off * (u.p0.x * dot(d, d));
+            return sample_bilinear(pc.x - shift.x, pc.y - shift.y);
         }
         case OP_MIX_BASE: {
             // an adjustment layer over the picture below it (`aux`): `FxOp::mix_base`

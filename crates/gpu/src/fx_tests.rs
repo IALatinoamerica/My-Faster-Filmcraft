@@ -1174,3 +1174,48 @@ fn gpu_adjustment_mix_with_the_picture_below_matches_cpu_exactly() {
     }
     assert!(!FxOp::MixBase { weight: f32::NAN, cov: None }.gpu_ok());
 }
+
+/// Each chain of effects on the GPU against its CPU reference (`FxOp::apply`), within `tol`.
+fn check_chains(w: u32, h: u32, at: Tick, chains: &[(Vec<EffectInstance>, f32)]) {
+    let Some((dev, q)) = device() else {
+        eprintln!("no GPU adapter; skipping");
+        return;
+    };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    for (effects, tol) in chains {
+        let names: Vec<&str> = effects.iter().map(|e| e.effect.as_str()).collect();
+        let ops: Vec<FxOp> =
+            effects.iter().map(|e| FxOp::eval(e, &cx(at, 1.0), w as usize, h as usize).unwrap_or_else(|| panic!("{names:?}: no op"))).collect();
+        assert!(ops.iter().all(FxOp::gpu_ok), "{names:?}: declined");
+        let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        for op in &ops {
+            op.apply(&mut cpu);
+        }
+        let changed = cpu.px.iter().zip(&px).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, turns: 0, ops }).expect("effect image");
+        let (worst, _) = compare(&cpu.px, &gpu);
+        eprintln!("{names:?} at {w}x{h}: worst difference {worst}");
+        assert!(worst < *tol, "{names:?}: worst difference {worst} (the effect changes the picture by {changed})");
+    }
+}
+
+/// Lens Distortion. The CPU works out where each pixel reads the picture in `f64`, the shader in
+/// `f32`: the positions differ by a fraction of a thousandth of a pixel, hence the tolerance.
+#[test]
+fn gpu_lens_distortion_matches_cpu() {
+    let blur = effect("gaussian_blur", &[("blurriness", fl(4.0))]);
+    check_chains(
+        96,
+        54,
+        Tick::ZERO,
+        &[
+            (vec![effect("lens_distortion", &[])], 2e-4),
+            (vec![effect("lens_distortion", &[("curvature", fl(-40.0)), ("h_decentering", fl(20.0)), ("v_decentering", fl(-35.0))])], 2e-4),
+            (vec![effect("lens_distortion", &[("curvature", fl(75.0))])], 2e-4),
+            (vec![blur.clone(), effect("lens_distortion", &[("curvature", fl(-90.0))]), blur], 2e-4),
+        ],
+    );
+    check_chains(1920, 1080, Tick::ZERO, &[(vec![effect("lens_distortion", &[("curvature", fl(-4.0))])], 2e-4)]);
+}

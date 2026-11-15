@@ -60,6 +60,43 @@ impl LumaKey {
     }
 }
 
+/// Lens Distortion: every pixel reads the picture (bilinear, transparent outside) at its offset
+/// from the centre (`cx`, `cy`) scaled by `1 − k·r²`, `r` the offset over `norm` (half the
+/// diagonal).
+#[derive(Clone, Debug, PartialEq)]
+pub struct LensDistortion {
+    pub k: f64,
+    pub cx: f64,
+    pub cy: f64,
+    pub norm: f64,
+}
+
+impl LensDistortion {
+    pub(crate) fn eval(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Self {
+        let (w, h) = (w as f64, h as f64);
+        Self {
+            k: f(e, "curvature", cx) as f64 / 100.0,
+            cx: w / 2.0 + f(e, "h_decentering", cx) as f64 / 100.0 * w / 2.0,
+            cy: h / 2.0 + f(e, "v_decentering", cx) as f64 / 100.0 * h / 2.0,
+            norm: (w / 2.0).hypot(h / 2.0),
+        }
+    }
+
+    pub(crate) fn gpu_ok(&self) -> bool {
+        [self.k, self.cx, self.cy, self.norm].iter().all(|v| v.is_finite() && v.abs() < 1e9) && self.norm > 0.0
+    }
+
+    pub(crate) fn apply(&self, img: &mut Image) {
+        let (k, cxp, cyp, norm) = (self.k, self.cx, self.cy, self.norm);
+        crate::effects::warp(img, |x, y| {
+            let (dx, dy) = ((x - cxp) / norm, (y - cyp) / norm);
+            let r2 = dx * dx + dy * dy;
+            let s = 1.0 - k * r2;
+            (cxp + dx * s * norm, cyp + dy * s * norm)
+        });
+    }
+}
+
 /// Rounded Crop: the rectangle `x0..x1` × `y0..y1` with corner radius `rad`, an inward `feather`
 /// (0: a one-pixel edge) and a `border` band of colour `bc` (linear) inside the edge.
 #[derive(Clone, Debug, PartialEq)]
@@ -458,6 +495,9 @@ mod tests {
         let green = ParamValue::Color([0.0, 1.0, 0.0, 1.0]);
         let custom = ParamValue::Choice(3);
         vec![
+            ("lens_distortion", vec![]),
+            ("lens_distortion", vec![("curvature", fl(-40.0)), ("h_decentering", fl(20.0)), ("v_decentering", fl(-35.0))]),
+            ("lens_distortion", vec![("curvature", fl(75.0))]),
             ("luma_key", vec![]),
             ("luma_key", vec![("threshold", fl(60.0)), ("cutoff", fl(20.0))]),
             ("luma_key", vec![("threshold", fl(30.0)), ("cutoff", fl(30.0)), ("invert", ParamValue::Bool(true))]),
@@ -523,7 +563,8 @@ mod tests {
     fn hostile_parameters_are_declined_or_bounded() {
         let img = picture(40, 24);
         let bad = [f64::NAN, f64::INFINITY, -f64::INFINITY, 1e30, -1e30];
-        let numeric: [(&str, &[&str]); 5] = [
+        let numeric: [(&str, &[&str]); 6] = [
+            ("lens_distortion", &["curvature", "h_decentering", "v_decentering"]),
             ("luma_key", &["threshold", "cutoff"]),
             ("rounded_crop", &["left", "right", "radius", "feather", "border"]),
             ("drop_shadow", &["opacity", "direction", "distance", "softness"]),

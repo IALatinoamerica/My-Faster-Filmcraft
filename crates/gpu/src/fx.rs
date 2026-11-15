@@ -68,6 +68,7 @@ const OP_KEY_MATTE: u32 = 107;
 const OP_KEY_CHOKE: u32 = 108;
 const OP_KEY_FINAL: u32 = 109;
 const OP_MIX_BASE: u32 = 110;
+const OP_LENS: u32 = 111;
 /// `effects::hash3`'s multiplier of the seed (the shader gets the product).
 const NOISE_SEED_MUL: u64 = 0x1656_67B1_9E37_79F9;
 
@@ -450,6 +451,7 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
                 last.combine = true;
             }
         }
+        FxOp::LensDistortion(l) => out.push(step(OP_LENS, [0; 4], &[l.k as f32, l.cx as f32, l.cy as f32, l.norm as f32])),
         FxOp::MixBase { weight, cov } => {
             // a plane of another size is a no-op, as on the CPU
             let fits = cov.as_ref().is_none_or(|c| (w as usize).checked_mul(h as usize) == Some(c.len()));
