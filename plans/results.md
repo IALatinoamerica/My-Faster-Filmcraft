@@ -24,3 +24,45 @@ CPU per due frame in the first four windows after 01: 9.1–9.4 ms.
 | 380 s | 544 | 569 |
 | 480 s | 540 | 560 |
 | 1060 s | 539 | 552 |
+
+## After 04–06 (Color Grading)
+
+Two copies of the project with one Color Grading that uses every section (Look LUT, wheels,
+curves, HSL Secondary with Denoise and Blur, Sharpen): `FX Color Grading CAM.fcproj` (on the 247
+camera clips of Video 3) and `FX Color Grading ADJ.fcproj` (on the 16 zoom layers of Video 2).
+Not measured before the change (the whole effect rendered on the CPU then).
+
+| Project | Window (start) | Frames shown of 600 | GPU pass per frame (p50) |
+|---|---|---|---|
+| CAM | 30 s | 582 | 12.3 ms |
+| CAM | 140 s | 559 | 12.0 ms |
+| ADJ | 30 s (no graded layer in the window) | 583 | 2.0 ms |
+| ADJ | 140 s | 561 | 11.8 ms |
+
+A full grade costs about 10 ms of the 16.7 ms a frame has at 60 fps on this GPU: it fits, with
+little room for a second heavy effect on the same frame at Full resolution.
+
+## The whole timeline, before and after
+
+136 windows of 10 s over `FULL TEST 02.fcproj` (the last one is 7.5 s long and left out of the
+figures), 600 frames due in each. FilmCraft was open during the first sweep and closed or idle
+during the second.
+
+| | Before | After 01–06 |
+|---|---|---|
+| Frames shown, mean per window | 431 | 571 |
+| Lowest window | 0 | 528 |
+| Windows with no frame shown | 19 | 0 |
+| Windows under 500 frames | 45 | 0 |
+| Frames shown in total (of 81 000) | 58 146 | 77 128 |
+
+What is left (about 29 frames per window) falls at cuts, where each decoder starts again from a
+keyframe: left out of this round by decision.
+
+## Checks
+
+Each stage: `cargo fmt`; clippy with warnings as errors on `filmcraft-render`, `filmcraft-gpu`
+and `filmcraft-ui-egui`; the tests of `filmcraft-render` and `filmcraft-gpu` and the unit tests
+of `filmcraft-ui-egui`, all passing. Not run: `cargo xtask ci` (the whole workspace and the web
+build). The audio was not measured: its crackling was explained from the code as a consequence of
+the CPU being saturated, which no longer happens in this project.

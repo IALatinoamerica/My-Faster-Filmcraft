@@ -67,6 +67,9 @@ the measured results in `plans/results.md`. In short:
 | Opacity masks on the GPU | A media clip with an opacity mask no longer renders on the CPU. | `crates/render/src/plan.rs` (`opacity_mask_op`, `MASK_PLANES`), `FxOp::Mask` in `crates/render/src/gpufx.rs`, `OP_MASK` in `crates/gpu/src/fx.rs` and `fx.wgsl` |
 | Transform with its own shutter angle on the GPU | An adjustment layer with such a Transform no longer sends the whole frame to the CPU. | `FxOp::ResampleBlur`, `transform_resample`, `SHUTTER_SAMPLES` in `gpufx.rs`; `OP_RESAMPLE_ACC` in `fx.rs` / `fx.wgsl`; `crates/render/src/vfx.rs` |
 | Five effects on the GPU | Luma Key, Rounded Crop, Drop Shadow, Noise (and legacy Noise), Ultra Key. | `crates/render/src/gpufx_more.rs` (ours entirely), their entries in `GPU_EFFECTS` in `gpufx.rs`, op codes 102–109 in `fx.rs` / `fx.wgsl` |
+| Adjustment layers that keep part of the picture below | A layer moved or scaled by Motion, not opaque or with an opacity mask no longer sends the whole frame to the CPU (a 10 px nudge used to). | `adjustment_weight` in `crates/render/src/lib.rs`; `adjustment_ops`, `adjustment_plane`, `ADJUSTMENT_PLANES` and the `Adjust` arm of `execute_cpu` in `plan.rs`; `FxOp::MixBase` and `mix_base` in `gpufx.rs`; `OP_MIX_BASE`, the kept base texture (`mix_base`) and the table binding (binding 4, `Step::table`) in `fx.rs` / `fx.wgsl` |
+| Three more effects on the GPU | Lens Distortion, Emboss, VR Digital Glitch (monoscopic). | `LensDistortion`, `Emboss`, `DigitalGlitch` in `gpufx_more.rs`; their entries in `GPU_EFFECTS` and `FxOp::eval`; op codes 111–113 |
+| All of Color Grading on the GPU | Looks, Color Wheels, Curves, Input LUT, Look LUT, HSL Secondary and Sharpen (upstream runs only Basic, Creative sliders and Vignette there). | `grade`, `GradeAdvanced`, `GradeLut`, `GradeHsl` in `gpufx_more.rs`; `FxOp::Seq` and the tail of the `"lumetri"` arm of `FxOp::eval` in `gpufx.rs`; `lut_step` and op codes 114–118 in `fx.rs` / `fx.wgsl`; `boxes_for_gauss`, `median_filter`, `blur_plane` made `pub(crate)` in `effects.rs` |
 | GPU placement of clips with a CPU-only effect | Such a media clip is uploaded at its own size, not as a full canvas. | `Unplaced`, `item_layer_unplaced` in `crates/render/src/lib.rs`; the CPU branch of `push_item` in `plan.rs` |
 | Sources fetched side by side | The clips of one frame are decoded at the same time. | `prefetch_sources`, `media_requests` in `plan.rs`; the call in `crates/ui-egui/src/frames.rs` |
 | No read-back of pictures nobody shows | After a jump, the hardware decoder does not copy back pictures before the wanted one. | `set_output_from` in `crates/codecs/src/video.rs`; `RETURN_BEFORE` in `crates/codecs/src/gop.rs`; `crates/platform/src/vaapi/{h264,hevc}.rs`, `vaapi.rs`, `hybrid.rs` |
@@ -75,10 +78,25 @@ the measured results in `plans/results.md`. In short:
 
 Each optimization has tests that compare it with the CPU renderer or count the work done. They
 are part of the optimization: keep them, and fix them when upstream changes something they use.
-Two upstream tests were changed on purpose, because they asserted the old slow behaviour:
-`transform_with_its_own_shutter_angle_runs_on_the_gpu_unless_it_shrinks` in `gpufx.rs`, and the
-"shutter angle … that shrinks the frame" case in `crates/render/src/adjustment_tests.rs`. If
-upstream edits those tests, keep our expectation.
+Three upstream tests were changed on purpose, because they asserted the old slow behaviour:
+
+- `transform_with_its_own_shutter_angle_runs_on_the_gpu_unless_it_shrinks` in `gpufx.rs`;
+- `an_adjustment_layer_the_gpu_cant_run_plans_the_frame_on_the_cpu` in
+  `crates/render/src/adjustment_tests.rs`: its shutter case shrinks the frame, its CPU-only effect
+  is Twirl instead of Emboss, and its "opacity 50 %" and "Motion at 50 %" cases are gone (they run
+  on the GPU now);
+- `lumetri_unsupported_sections_fall_back` in `crates/gpu/src/fx_tests.rs`: only HDR and a Denoise
+  window over 3 pixels still fall back.
+
+If upstream edits those tests, keep our expectation.
+
+What still renders on the CPU, by decision: an effect with a mask of its own, blend modes other
+than Normal on an adjustment layer, HDR sequences, and effects with no GPU version (Twirl and
+others). An effect upstream adds later has no GPU version here until one is written.
+
+A mistake in `fx.wgsl` (even a reserved word used as a name) makes the whole effect stage fail
+to start, and every effect then renders on the CPU without any error on screen. The GPU tests in
+`crates/gpu` catch it: they fail with "effect image".
 
 ## 1. Before touching anything
 
@@ -128,7 +146,7 @@ A conflict means upstream changed lines next to ours. The rule for each one:
 After a merge, conflict or not, check these collisions by hand, because Git cannot see them:
 
 - **Op code numbers.** Each GPU op has a number that must be the same in `crates/gpu/src/fx.rs`
-  and `crates/gpu/src/fx.wgsl` and unique in both. Ours are 100–109. If upstream's numbering
+  and `crates/gpu/src/fx.wgsl` and unique in both. Ours are 100–118. If upstream's numbering
   reaches that range, renumber ours in both files.
 - **`GPU_EFFECTS` and the `match` in `FxOp::eval`** (`gpufx.rs`): an effect name must appear once.
   If upstream added one of ours, remove upstream's entry and arm so that ours runs, and say so in
@@ -206,6 +224,19 @@ For the five effects, the same folder has `FX <effect> CAM.fcproj` and `FX <effe
 `gpufx.rs`, `gpufx_more.rs`, `fx.rs` or `fx.wgsl`, with the same `project` command. After our
 work each showed 568–581 of 600; before, 0–4. `FX Twirl` is the control: it has no GPU version
 and stays near 0.
+
+A second project, `FULL TEST 02.fcproj` (sequence `EDIT_PR_282 News Nov 02`), exercises the
+second round of optimizations. Run the same `project` command on it; frames shown of 600:
+
+| Start | What it exercises | With our work | Without |
+|---|---|---|---|
+| 140 | adjustment layer nudged 10 px off the frame | 558 | 0 |
+| 720 | the same with a Lens Distortion transition | 583 | 11 |
+| 380 | Emboss and VR Digital Glitch transition | 569 | 544 |
+
+`FX Color Grading CAM.fcproj` and `FX Color Grading ADJ.fcproj` (same sequence name, start 140)
+carry a Color Grading with every section in use: 559 and 561 with our work. Without it the whole
+effect renders on the CPU; a window that falls to a handful of frames means that was lost.
 
 If upstream is now faster than us somewhere, that is not a reason to change anything; report it.
 
