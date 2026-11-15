@@ -72,6 +72,7 @@ const OP_LENS: u32 = 111u;
 const OP_EMBOSS: u32 = 112u;
 const OP_GLITCH: u32 = 113u;
 const OP_GRADE_ADV: u32 = 114u;
+const OP_LUT: u32 = 115u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -770,6 +771,80 @@ fn key_matte(o: vec4<f32>) -> f32 {
     return clamp((clamp(m, 0.0, 1.0) - u.p2.x) / (1.0 - u.p2.x), 0.0, 1.0);
 }
 
+// Value `i` of the pass's table (rows of 1024).
+fn tbl_at(i: i32) -> f32 {
+    return textureLoad(tbl, vec2(i % 1024, i / 1024), 0).r;
+}
+
+// Entry `i` (r, g, b) of the table part that starts at value `base`.
+fn tbl_rgb(base: i32, i: i32) -> vec3<f32> {
+    let k = base + i * 3;
+    return vec3(tbl_at(k), tbl_at(k + 1), tbl_at(k + 2));
+}
+
+// A Color Grading LUT on a colour in 0..1 (`filmcraft_color::Lut::apply`): the shaper
+// (i1.x entries, domain p1..p2), per channel and linear, then the cube (side i1.y, domain
+// p3..p4), tetrahedral. The table holds the shaper's entries, then the cube's, red fastest.
+fn lut_apply(v: vec3<f32>) -> vec3<f32> {
+    var c = v;
+    let n1 = i32(u.i1.x);
+    if n1 > 1 {
+        let n = n1 - 1;
+        let t = clamp((c - u.p1.xyz) / (u.p2.xyz - u.p1.xyz), vec3(0.0), vec3(1.0)) * f32(n);
+        let i = min(vec3<i32>(t), vec3(n - 1));
+        let j = min(i + vec3(1), vec3(n));
+        let f = t - vec3<f32>(i);
+        let a = vec3(tbl_at(i.x * 3), tbl_at(i.y * 3 + 1), tbl_at(i.z * 3 + 2));
+        let b = vec3(tbl_at(j.x * 3), tbl_at(j.y * 3 + 1), tbl_at(j.z * 3 + 2));
+        c = a + (b - a) * f;
+    }
+    let size = i32(u.i1.y);
+    if size > 1 {
+        let base = n1 * 3;
+        let q = clamp((c - u.p3.xyz) / (u.p4.xyz - u.p3.xyz), vec3(0.0), vec3(1.0)) * f32(size - 1);
+        let i0 = min(vec3<i32>(q), vec3(size - 2));
+        let f = q - vec3<f32>(i0);
+        let o = i0.x + i0.y * size + i0.z * size * size;
+        let dr = 1;
+        let dg = size;
+        let db = size * size;
+        let c000 = tbl_rgb(base, o);
+        let c111 = tbl_rgb(base, o + dr + dg + db);
+        var ca: vec3<f32>;
+        var cb: vec3<f32>;
+        var w: vec4<f32>;
+        if f.x > f.y {
+            if f.y > f.z {
+                ca = tbl_rgb(base, o + dr);
+                cb = tbl_rgb(base, o + dr + dg);
+                w = vec4(1.0 - f.x, f.x - f.y, f.y - f.z, f.z);
+            } else if f.x > f.z {
+                ca = tbl_rgb(base, o + dr);
+                cb = tbl_rgb(base, o + dr + db);
+                w = vec4(1.0 - f.x, f.x - f.z, f.z - f.y, f.y);
+            } else {
+                ca = tbl_rgb(base, o + db);
+                cb = tbl_rgb(base, o + dr + db);
+                w = vec4(1.0 - f.z, f.z - f.x, f.x - f.y, f.y);
+            }
+        } else if f.z > f.y {
+            ca = tbl_rgb(base, o + db);
+            cb = tbl_rgb(base, o + dg + db);
+            w = vec4(1.0 - f.z, f.z - f.y, f.y - f.x, f.x);
+        } else if f.z > f.x {
+            ca = tbl_rgb(base, o + dg);
+            cb = tbl_rgb(base, o + dg + db);
+            w = vec4(1.0 - f.y, f.y - f.z, f.z - f.x, f.x);
+        } else {
+            ca = tbl_rgb(base, o + dg);
+            cb = tbl_rgb(base, o + dr + dg);
+            w = vec4(1.0 - f.y, f.y - f.x, f.x - f.z, f.z);
+        }
+        c = w.x * c000 + w.y * ca + w.z * cb + w.w * c111;
+    }
+    return c;
+}
+
 // Color Grading's curve `row` of the table at `x` (`lumetri_advanced`'s `sample`: 1024 entries
 // over 0..1, linear between them).
 fn curve_at(row: i32, x: f32) -> f32 {
@@ -825,9 +900,13 @@ fn apply_look(look: u32, c: vec3<f32>) -> vec3<f32> {
 }
 
 // `gpufx_more::GradeAdvanced::apply` on a straight linear colour: i1 = (look, curve mask, wheels
-// in use), p0.x = look intensity, p1..p3 = shadows / midtones / highlights (wheel RGB, luminance).
+// in use, the colour is the encoded signal a Look LUT pass left), p0.x = look intensity, p1..p3 =
+// shadows / midtones / highlights (wheel RGB, luminance).
 fn grade_advanced(c: vec3<f32>) -> vec3<f32> {
-    var v = enc(c);
+    var v = c;
+    if u.i1.w == 0u {
+        v = enc(c);
+    }
     if u.i1.x > 0u {
         v = v + (apply_look(u.i1.x, v) - v) * u.p0.x;
     }
@@ -1053,6 +1132,24 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             let na = a * o.a;
             return vec4(l * na, na);
+        }
+        case OP_LUT: {
+            // a Color Grading LUT: p0.x = how much of it; i1.z: write the linear colour
+            let o = ld(p);
+            if o.a <= 1e-6 {
+                return o;
+            }
+            var v = enc(o.rgb / o.a);
+            let lk = lut_apply(clamp(v, vec3(0.0), vec3(1.0)));
+            if u.p0.x == 1.0 && u.i1.z != 0u {
+                v = lk;
+            } else {
+                v = v + (lk - v) * u.p0.x;
+            }
+            if u.i1.z != 0u {
+                v = dec(v);
+            }
+            return vec4(v * o.a, o.a);
         }
         case OP_GRADE_ADV: {
             let o = ld(p);

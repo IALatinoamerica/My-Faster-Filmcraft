@@ -232,6 +232,81 @@ impl DigitalGlitch {
     }
 }
 
+/// Texels in a row of a table an op hands to the effect stage.
+pub const TABLE_W: usize = 1024;
+/// Largest LUT the effect stage takes: the side of its cube and the entries of its shaper. A
+/// larger one is the CPU's.
+pub const LUT_MAX_CUBE: usize = 65;
+pub const LUT_MAX_SHAPER: usize = 4096;
+
+/// A Color Grading LUT (Input LUT, Look LUT) for the effect stage: the LUT, and its numbers as one
+/// table of rows of [`TABLE_W`]: the shaper's entries (r, g, b each), then the cube's, red
+/// fastest; the last row is padded with zeros.
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradeLut {
+    pub lut: std::sync::Arc<filmcraft_color::Lut>,
+    pub table: std::sync::Arc<Vec<f32>>,
+}
+
+/// The tables of the LUTs in use, most recently used last: a LUT is flattened once, and the
+/// compositor finds the uploaded table by its address.
+type LutTables = Vec<(std::sync::Arc<filmcraft_color::Lut>, std::sync::Arc<Vec<f32>>)>;
+static LUT_TABLES: std::sync::Mutex<LutTables> = std::sync::Mutex::new(Vec::new());
+const MAX_LUT_TABLES: usize = 6;
+
+impl GradeLut {
+    pub fn new(lut: std::sync::Arc<filmcraft_color::Lut>) -> Self {
+        let mut tables = LUT_TABLES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(i) = tables.iter().position(|(l, _)| std::sync::Arc::ptr_eq(l, &lut)) {
+            let hit = tables.remove(i);
+            let table = hit.1.clone();
+            tables.push(hit);
+            return Self { lut, table };
+        }
+        let fits = lut.shaper.as_ref().is_none_or(|s| s.data.len() <= LUT_MAX_SHAPER) && lut.cube.as_ref().is_none_or(|c| c.size <= LUT_MAX_CUBE);
+        let mut values: Vec<f32> = Vec::new();
+        // (a LUT too large for the stage is declined: no table is made for it)
+        if fits {
+            values.extend(lut.shaper.iter().flat_map(|s| s.data.iter().flatten()));
+            values.extend(lut.cube.iter().flat_map(|c| c.data.iter().flatten()));
+            values.resize(values.len().div_ceil(TABLE_W).max(1) * TABLE_W, 0.0);
+        }
+        let table = std::sync::Arc::new(values);
+        if tables.len() >= MAX_LUT_TABLES {
+            tables.remove(0);
+        }
+        tables.push((lut.clone(), table.clone()));
+        Self { lut, table }
+    }
+
+    /// Entries of the shaper (0: none) and the side of the cube (0: none).
+    pub fn sizes(&self) -> (usize, usize) {
+        (self.lut.shaper.as_ref().map_or(0, |s| s.data.len()), self.lut.cube.as_ref().map_or(0, |c| c.size))
+    }
+
+    pub(crate) fn gpu_ok(&self) -> bool {
+        let span = |lo: &[f32; 3], hi: &[f32; 3]| lo.iter().zip(hi).all(|(a, b)| a.is_finite() && b.is_finite() && (b - a).is_finite() && b != a);
+        let (n1, size) = self.sizes();
+        let shaper = self.lut.shaper.as_ref().is_none_or(|s| (2..=LUT_MAX_SHAPER).contains(&n1) && span(&s.domain_min, &s.domain_max));
+        let cube = self
+            .lut
+            .cube
+            .as_ref()
+            .is_none_or(|c| (2..=LUT_MAX_CUBE).contains(&size) && c.data.len() == size * size * size && span(&c.domain_min, &c.domain_max));
+        shaper && cube && self.table.len() >= (n1 + size * size * size) * 3 && !self.table.is_empty() && fin(&self.table)
+    }
+
+    /// The LUT on a display-encoded colour, as `effects::within_unit` hands it to it on SDR.
+    fn look_up(&self, v: [f32; 3]) -> [f32; 3] {
+        self.lut.apply(v.map(|q| q.clamp(0.0, 1.0)))
+    }
+
+    /// The Input LUT, before the Basic controls.
+    pub(crate) fn apply(&self, img: &mut Image) {
+        img.map_rgb(|c, _, _| dec(self.look_up(enc(c))));
+    }
+}
+
 /// Entries of a Color Grading curve table (`effects::lumetri_advanced`'s `N`).
 pub const CURVE_N: usize = 1024;
 /// The curves of [`GradeAdvanced`], in the order of their rows in its table and of the bits of
@@ -240,12 +315,13 @@ pub const CURVE_IDS: [&str; 9] =
     ["curve_luma", "curve_red", "curve_green", "curve_blue", "hue_vs_sat", "hue_vs_hue", "hue_vs_luma", "luma_vs_sat", "sat_vs_sat"];
 
 /// Color Grading after its Basic controls, as `effects::lumetri_advanced` runs it on an SDR
-/// sequence: the built-in Look (mixed in by `look_k`), the three Color Wheels, the RGB and luma
+/// sequence: the Look LUT or else the built-in Look (mixed in by `look_k`), the three Color Wheels, the RGB and luma
 /// curves, then the hue and saturation curves in HSL. `table` holds one row of [`CURVE_N`]
 /// entries per curve of [`CURVE_IDS`] (bit `i` of `curves`: curve `i` is in use; unused rows are
 /// zero).
 #[derive(Clone, Debug, PartialEq)]
 pub struct GradeAdvanced {
+    pub look_lut: Option<GradeLut>,
     pub look: u32,
     pub look_k: f32,
     /// Shadows, midtones, highlights: the wheel's RGB direction and its luminance slider.
@@ -272,7 +348,9 @@ impl GradeAdvanced {
                 curves |= 1 << i;
             }
         }
-        let look = if creative_on { choice(e, "look") } else { 0 };
+        // a LUT takes precedence over the menu of built-in Looks
+        let look_lut = if creative_on { crate::luts::resolve(cx.project, crate::effects::text(e, "look_lut")).map(GradeLut::new) } else { None };
+        let look = if creative_on && look_lut.is_none() { choice(e, "look") } else { 0 };
         let look_k = f(e, "look_intensity", cx) / 100.0;
         let v2 = |id: &str| e.param(id).map(|p| p.vec2_at(cx.t)).unwrap_or_default();
         let l = |id: &str| f(e, id, cx) / 100.0;
@@ -282,11 +360,22 @@ impl GradeAdvanced {
         };
         let w = [wheel("wheel_shadows", "wheel_shadows_l"), wheel("wheel_midtones", "wheel_midtones_l"), wheel("wheel_highlights", "wheel_highlights_l")];
         let wheels = wheels_on && (w.iter().any(|q| q[..3].iter().any(|v| v.abs() > 1e-5)) || w[0][3].abs() + w[1][3].abs() + w[2][3].abs() > 1e-5);
-        (curves != 0 || look > 0 || wheels).then(|| Self { look, look_k, wheels: wheels.then_some(w), curves, table: std::sync::Arc::new(table) })
+        (curves != 0 || look > 0 || look_lut.is_some() || wheels).then(|| Self {
+            look_lut,
+            look,
+            look_k,
+            wheels: wheels.then_some(w),
+            curves,
+            table: std::sync::Arc::new(table),
+        })
     }
 
     pub(crate) fn gpu_ok(&self) -> bool {
-        self.look_k.is_finite() && self.wheels.is_none_or(|w| w.iter().all(|q| fin(q))) && self.table.len() == CURVE_N * CURVE_IDS.len() && fin(&self.table)
+        self.look_lut.as_ref().is_none_or(GradeLut::gpu_ok)
+            && self.look_k.is_finite()
+            && self.wheels.is_none_or(|w| w.iter().all(|q| fin(q)))
+            && self.table.len() == CURVE_N * CURVE_IDS.len()
+            && fin(&self.table)
     }
 
     fn curve(&self, i: usize) -> Option<&[f32]> {
@@ -304,10 +393,14 @@ impl GradeAdvanced {
         let (luma_c, red_c, green_c, blue_c) = (self.curve(0), self.curve(1), self.curve(2), self.curve(3));
         let (hvs, hvh, hvl, lvs, svs) = (self.curve(4), self.curve(5), self.curve(6), self.curve(7), self.curve(8));
         let (look, look_k) = (self.look, self.look_k);
+        let look_lut = self.look_lut.as_ref();
         let wheels = self.wheels;
         img.map_rgb(|c, _, _| {
             let mut v = enc(c);
-            if look > 0 {
+            if let Some(l) = look_lut {
+                let lk = l.look_up(v);
+                v = [v[0] + (lk[0] - v[0]) * look_k, v[1] + (lk[1] - v[1]) * look_k, v[2] + (lk[2] - v[2]) * look_k];
+            } else if look > 0 {
                 let lk = crate::effects::apply_look(look, v);
                 v = [v[0] + (lk[0] - v[0]) * look_k, v[1] + (lk[1] - v[1]) * look_k, v[2] + (lk[2] - v[2]) * look_k];
             }
@@ -370,15 +463,16 @@ pub(crate) fn grade(e: &EffectInstance, cx: &FxCtx, mut basic: crate::gpufx::FxO
     use crate::effects::{on, text};
     use crate::gpufx::FxOp;
     let (basic_on, creative_on) = (on(e, "basic_on"), on(e, "creative_on"));
-    let input_lut = basic_on && !text(e, "input_lut").is_empty();
-    let look_lut = creative_on && !text(e, "look_lut").is_empty();
     let sharpen = creative_on && (f(e, "sharpen", cx) / 100.0).abs() > 1e-3;
-    if input_lut || look_lut || sharpen || b(e, "hsl_on") {
+    if sharpen || b(e, "hsl_on") {
         return basic;
     }
     let FxOp::Lumetri { gpu_capable, .. } = &mut basic else { return basic };
     *gpu_capable = true;
-    let mut ops = vec![basic];
+    // (a reference to a LUT that is gone resolves to none, and the grade goes on without it)
+    let input_lut = if basic_on { crate::luts::resolve(cx.project, text(e, "input_lut")) } else { None };
+    let mut ops: Vec<FxOp> = input_lut.map(|l| FxOp::GradeLut(Box::new(GradeLut::new(l)))).into_iter().collect();
+    ops.push(basic);
     ops.extend(GradeAdvanced::eval(e, cx).map(|a| FxOp::GradeAdvanced(Box::new(a))));
     FxOp::Seq(ops)
 }
@@ -814,7 +908,22 @@ mod tests {
         all.extend(wheels);
         all.extend(rgb);
         all.extend(hue);
+        out.push(("lumetri", all.clone()));
+        // the LUTs: a camera conversion as the Input LUT, a Look as the Look LUT
+        let builtin = |look: bool| {
+            let b = crate::luts::builtins().iter().find(|b| b.id.starts_with("look-") == look).expect("a built-in LUT");
+            ParamValue::Text(format!("builtin:{}", b.id))
+        };
+        out.push(("lumetri", vec![("input_lut", builtin(false))]));
+        out.push(("lumetri", vec![("look_lut", builtin(true)), ("look_intensity", fl(60.0))]));
+        out.push(("lumetri", vec![("look_lut", builtin(true)), ("look", ParamValue::Choice(3)), ("wheel_midtones_l", fl(40.0))]));
+        all.extend([("input_lut", builtin(false)), ("look_lut", builtin(true)), ("look_intensity", fl(130.0))]);
         out.push(("lumetri", all));
+        // a reference to a LUT that is not there: the grade goes on without it
+        out.push((
+            "lumetri",
+            vec![("input_lut", ParamValue::Text("lib:gone".into())), ("look_lut", ParamValue::Text("nonsense".into())), ("look", ParamValue::Choice(2))],
+        ));
         out
     }
 

@@ -834,15 +834,13 @@ fn lumetri_unsupported_sections_fall_back() {
     let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
     assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
 
-    // input_lut alone
-    let e = effect("lumetri", &[("input_lut", ParamValue::Text("test.cube".into()))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // look_lut
-    let e = effect("lumetri", &[("look_lut", ParamValue::Text("look.cube".into()))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+    // a LUT reference that resolves to no LUT is no LUT on the CPU either: the grade runs on the
+    // GPU without it (the LUTs themselves: `gpu_color_grading_luts_match_cpu`)
+    for id in ["input_lut", "look_lut"] {
+        let e = effect("lumetri", &[(id, ParamValue::Text("test.cube".into()))]);
+        let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
+        assert!(op.as_ref().is_some_and(FxOp::gpu_ok), "{id}");
+    }
 
     // a built-in Look, the curves and the Color Wheels have passes of their own
     for params in [
@@ -1285,4 +1283,60 @@ fn gpu_color_grading_looks_wheels_and_curves_match_cpu() {
         assert!(matches!(op, FxOp::Seq(_)), "an advanced grade is a sequence of passes");
     }
     check_chains(96, 54, Tick::ZERO, &chains);
+}
+
+/// Color Grading's LUTs: a camera conversion as the Input LUT and a Look as the Look LUT (33³
+/// cubes), alone, with the rest of the grade, and a LUT with a shaper and an uneven domain.
+#[test]
+fn gpu_color_grading_luts_match_cpu() {
+    let builtin = |look: bool| {
+        let b = filmcraft_render::luts::builtins().iter().find(|b| b.id.starts_with("look-") == look).expect("a built-in LUT");
+        ParamValue::Text(format!("builtin:{}", b.id))
+    };
+    let [wheels, rgb, hue] = grade_parts();
+    let mut all = vec![("input_lut", builtin(false)), ("look_lut", builtin(true)), ("look_intensity", fl(130.0)), ("contrast", fl(25.0))];
+    all.extend(wheels);
+    all.extend(rgb);
+    all.extend(hue);
+    check_chains(
+        96,
+        54,
+        Tick::ZERO,
+        &[
+            (vec![effect("lumetri", &[("input_lut", builtin(false))])], 1e-5),
+            (vec![effect("lumetri", &[("look_lut", builtin(true)), ("look_intensity", fl(60.0))])], 1e-5),
+            (vec![effect("lumetri", &[("look_lut", builtin(true)), ("wheel_midtones_l", fl(40.0))])], 1e-5),
+            (vec![effect("lumetri", &all)], 1e-5),
+        ],
+    );
+    // a shaper in front of a small cube, both over a domain that is not 0..1
+    let Some((dev, q)) = device() else { return };
+    let mut c = GpuCompositor::new(&dev, &q);
+    let (w, h) = (96u32, 54u32);
+    let px = picture(w, h);
+    let frame = VideoFrame::rgba_f32(w, h, px.clone());
+    let shaper = filmcraft_color::Lut1d {
+        domain_min: [0.0, 0.05, -0.1],
+        domain_max: [1.0, 0.9, 1.2],
+        data: (0..17).map(|i| i as f32 / 16.0).map(|x| [x * x, x.sqrt(), 1.0 - x]).collect(),
+    };
+    let mut cube = filmcraft_color::Lut3d::from_fn(5, |c| [c[1] * 0.9 + 0.05, (c[0] * c[2]).sqrt(), 1.0 - c[0] * 0.5]);
+    cube.domain_min = [0.1, 0.0, 0.0];
+    cube.domain_max = [0.9, 1.0, 1.5];
+    for lut in [
+        filmcraft_color::Lut { title: String::new(), shaper: Some(shaper.clone()), cube: Some(cube.clone()) },
+        filmcraft_color::Lut { title: String::new(), shaper: Some(shaper), cube: None },
+        filmcraft_color::Lut { title: String::new(), shaper: None, cube: Some(cube) },
+    ] {
+        let op = FxOp::GradeLut(Box::new(filmcraft_render::gpufx_more::GradeLut::new(Arc::new(lut))));
+        assert!(op.gpu_ok());
+        let mut cpu = filmcraft_render::Image { w: w as usize, h: h as usize, px: px.clone() };
+        op.apply(&mut cpu);
+        let (_, _, gpu) = c.effect_image(&frame, &LayerFx { size: (w, h), decimation: 1, turns: 0, ops: vec![op] }).expect("effect image");
+        let (worst, _) = compare(&cpu.px, &gpu);
+        assert!(worst < 1e-5, "a LUT with a shaper: worst difference {worst}");
+    }
+    // a LUT larger than the stage takes is declined
+    let big = filmcraft_color::Lut::from_cube(filmcraft_color::Lut3d::identity(filmcraft_render::gpufx_more::LUT_MAX_CUBE + 1));
+    assert!(!FxOp::GradeLut(Box::new(filmcraft_render::gpufx_more::GradeLut::new(Arc::new(big)))).gpu_ok());
 }

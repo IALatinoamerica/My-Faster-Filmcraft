@@ -260,6 +260,8 @@ pub enum FxOp {
     /// controls).
     Seq(Vec<FxOp>),
     GradeAdvanced(Box<crate::gpufx_more::GradeAdvanced>),
+    /// Color Grading's Input LUT.
+    GradeLut(Box<crate::gpufx_more::GradeLut>),
     DigitalGlitch(crate::gpufx_more::DigitalGlitch),
 }
 
@@ -820,6 +822,7 @@ impl FxOp {
             FxOp::Emboss(m) => m.gpu_ok(),
             FxOp::Seq(ops) => ops.iter().all(FxOp::gpu_ok),
             FxOp::GradeAdvanced(g) => g.gpu_ok(),
+            FxOp::GradeLut(l) => l.gpu_ok(),
             FxOp::DigitalGlitch(g) => g.gpu_ok(),
         }
     }
@@ -1146,6 +1149,7 @@ impl FxOp {
             FxOp::Emboss(m) => m.apply(img),
             FxOp::Seq(ops) => ops.iter().for_each(|op| op.apply(img)),
             FxOp::GradeAdvanced(g) => g.apply(img),
+            FxOp::GradeLut(l) => l.apply(img),
             FxOp::DigitalGlitch(g) => g.apply(img),
             FxOp::Mask { cov } => {
                 if cov.len().checked_mul(4) == Some(img.px.len()) {

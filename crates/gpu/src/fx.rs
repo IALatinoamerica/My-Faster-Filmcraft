@@ -72,11 +72,15 @@ const OP_LENS: u32 = 111;
 const OP_EMBOSS: u32 = 112;
 const OP_GLITCH: u32 = 113;
 const OP_GRADE_ADV: u32 = 114;
+const OP_LUT: u32 = 115;
 /// `effects::hash3`'s multiplier of the seed (the shader gets the product).
 const NOISE_SEED_MUL: u64 = 0x1656_67B1_9E37_79F9;
 
 /// Coverage planes of opacity masks kept as textures (a static mask is one plane for every frame).
 const MASK_PLANES: usize = 8;
+/// A table of more values than this is kept as a texture like a plane (a LUT); a smaller one
+/// (curves, the rows of a glitch) is made for the job.
+const KEPT_TABLE: usize = 1 << 14;
 
 type Target = (wgpu::Texture, wgpu::TextureView);
 
@@ -148,6 +152,23 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
         *d = *s;
     }
     Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), plane: None, reads_orig: false, mix_base: false, table: None }
+}
+
+/// The pass of a Color Grading LUT: the LUT on the display-encoded colour, mixed in by `mix`;
+/// `decode` writes the linear colour, otherwise the encoded signal goes on to the next pass.
+fn lut_step(l: &filmcraft_render::gpufx_more::GradeLut, mix: f32, decode: bool) -> Step {
+    use filmcraft_render::gpufx_more::TABLE_W;
+    let (n1, size) = l.sizes();
+    let dom =
+        |d: Option<(&[f32; 3], &[f32; 3])>| d.map_or([0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0], |(lo, hi)| [lo[0], lo[1], lo[2], 0.0, hi[0], hi[1], hi[2], 0.0]);
+    let shaper = dom(l.lut.shaper.as_ref().map(|s| (&s.domain_min, &s.domain_max)));
+    let cube = dom(l.lut.cube.as_ref().map(|c| (&c.domain_min, &c.domain_max)));
+    let mut p = vec![mix, 0.0, 0.0, 0.0];
+    p.extend(shaper);
+    p.extend(cube);
+    let mut s = step(OP_LUT, [n1 as u32, size as u32, decode as u32, 0], &p);
+    s.table = Some((l.table.clone(), TABLE_W as u32, (l.table.len() / TABLE_W) as u32));
+    s
 }
 
 /// `values` (`w` × `h` of them, row by row) as a texture of one `R32Float` texel each.
@@ -488,10 +509,19 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
                 wh[1][0], wh[1][1], wh[1][2], wh[1][3], //
                 wh[2][0], wh[2][1], wh[2][2], wh[2][3],
             ];
-            let mut s = step(OP_GRADE_ADV, [g.look, g.curves, g.wheels.is_some() as u32, 0], &p);
-            s.table = Some((g.table.clone(), CURVE_N as u32, CURVE_IDS.len() as u32));
-            out.push(s);
+            // The Look LUT is a pass of its own (its table is the LUT). It hands the next pass the
+            // display-encoded signal as it is, not clamped, as the CPU goes on with it.
+            let rest = g.look > 0 || g.curves != 0 || g.wheels.is_some();
+            if let Some(l) = &g.look_lut {
+                out.push(lut_step(l, g.look_k, !rest));
+            }
+            if rest {
+                let mut s = step(OP_GRADE_ADV, [g.look, g.curves, g.wheels.is_some() as u32, g.look_lut.is_some() as u32], &p);
+                s.table = Some((g.table.clone(), CURVE_N as u32, CURVE_IDS.len() as u32));
+                out.push(s);
+            }
         }
+        FxOp::GradeLut(l) => out.push(lut_step(l, 1.0, true)),
         FxOp::Emboss(m) => out.push(step(OP_EMBOSS, [0; 4], &[m.dx, m.dy, m.contrast, m.blend])),
         FxOp::DigitalGlitch(g) => {
             // (no rows: the effect does nothing)
@@ -743,11 +773,9 @@ impl FxStage {
                 Some((values, tw, th)) if (*tw as usize).checked_mul(*th as usize) == Some(values.len()) && *tw <= max && *th <= max && !values.is_empty() => {
                     // a plane of the picture's size is kept for the frames that share it; a small
                     // table changes from frame to frame and would push the planes out
-                    Some(if (*tw, *th) == (w, h) {
-                        self.plane_texture(device, queue, values, *tw, *th)
-                    } else {
-                        table_texture(device, queue, values, *tw, *th)
-                    })
+                    // (a large table is a LUT, which also stays the same from frame to frame)
+                    let kept = (*tw, *th) == (w, h) || values.len() > KEPT_TABLE;
+                    Some(if kept { self.plane_texture(device, queue, values, *tw, *th) } else { table_texture(device, queue, values, *tw, *th) })
                 }
                 _ => None,
             };
