@@ -543,6 +543,7 @@ impl FxOp {
                         let at = FxCtx {
                             t: cx.t + filmcraft_time::Tick::from_seconds_f64(k * span),
                             px_scale: cx.px_scale,
+                            mask_scale: cx.mask_scale,
                             seconds: cx.seconds + k * span,
                             timecode: cx.timecode,
                             clip_name: cx.clip_name,
@@ -1333,6 +1334,7 @@ mod tests {
         let cx = FxCtx {
             t: Tick::ZERO,
             px_scale: 1.0,
+            mask_scale: 1.0,
             seconds: 0.0,
             timecode: "",
             clip_name: "",
@@ -1382,6 +1384,7 @@ mod tests {
         let cx = FxCtx {
             t: Tick::ZERO,
             px_scale: 1.0,
+            mask_scale: 1.0,
             seconds: 0.0,
             timecode: "",
             clip_name: "",

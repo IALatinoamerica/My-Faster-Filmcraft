@@ -408,6 +408,7 @@ mod tests {
         FxCtx {
             t: Tick(123_456_789_012),
             px_scale,
+            mask_scale: px_scale,
             seconds: 0.5,
             timecode: "",
             clip_name: "",
