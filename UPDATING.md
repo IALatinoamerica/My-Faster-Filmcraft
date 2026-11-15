@@ -360,4 +360,4 @@ asks.
 
 | Date | Release | Base before | Conflicts | Result | Installed |
 |---|---|---|---|---|---|
-| 2026-11-14 | v0.20.1 (`cedf0c9b`) | upstream `main` at `0dba3b1e` (2026-11-10, version 0.17.0) | `crates/codecs/src/gop.rs`, `crates/codecs/src/gop/tests.rs`, `crates/render/src/lib.rs`; `mask_scale` added in `gpufx.rs` and `gpufx_more.rs` | Merge `28061b8e`. Play 581 / 597 / 573, seek 291 / 441 ms. | `0.20.1-1+fork.28061b8e`, over the official `0.20.1-1`. Built without the extra fonts (`CRAFT_FONTS_DIR` unset), by Bruno's choice. |
+| 2026-11-14 | v0.20.1 (`cedf0c9b`) | upstream `main` at `0dba3b1e` (2026-11-10, version 0.17.0) | `crates/codecs/src/gop.rs`, `crates/codecs/src/gop/tests.rs`, `crates/render/src/lib.rs`; `mask_scale` added in `gpufx.rs` and `gpufx_more.rs` | Merge `28061b8e`. Play 581 / 597 / 573, seek 291 / 441 ms. | `0.20.1-1+fork.28061b8e`, over the official `0.20.1-1`. Built without the extra fonts (`CRAFT_FONTS_DIR` unset), by Bruno's choice. Reinstalled from later commits on the same base as rounds 2 and 3 of optimizations were added (2026-11-15). |
