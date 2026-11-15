@@ -844,30 +844,17 @@ fn lumetri_unsupported_sections_fall_back() {
     let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
     assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
 
-    // look > 0
-    let e = effect("lumetri", &[("look", ch(1))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // curve_luma modified
-    let e = effect("lumetri", &[("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [1.0, 0.9]]))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // hue_vs_sat non-empty
-    let e = effect("lumetri", &[("hue_vs_sat", ParamValue::Curve(vec![[0.5, 0.5]]))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // wheel offset
-    let e = effect("lumetri", &[("wheel_shadows", pt(0.5, 0.0))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
-
-    // wheel lightness
-    let e = effect("lumetri", &[("wheel_midtones_l", fl(20.0))]);
-    let op = FxOp::eval(&e, &cx(Tick::ZERO, 1.0), w, h);
-    assert!(op.as_ref().is_some_and(|o| !o.gpu_ok()));
+    // a built-in Look, the curves and the Color Wheels have passes of their own
+    for params in [
+        vec![("look", ch(1))],
+        vec![("curve_luma", ParamValue::Curve(vec![[0.0, 0.1], [1.0, 0.9]]))],
+        vec![("hue_vs_sat", ParamValue::Curve(vec![[0.5, 0.5]]))],
+        vec![("wheel_shadows", pt(0.5, 0.0))],
+        vec![("wheel_midtones_l", fl(20.0))],
+    ] {
+        let op = FxOp::eval(&effect("lumetri", &params), &cx(Tick::ZERO, 1.0), w, h);
+        assert!(op.as_ref().is_some_and(FxOp::gpu_ok), "{params:?} runs on the GPU");
+    }
 
     // HSL secondary on
     let e = effect("lumetri", &[("hsl_on", ParamValue::Bool(true))]);
@@ -1242,4 +1229,60 @@ fn gpu_emboss_and_digital_glitch_match_cpu() {
         ],
     );
     check_chains(1920, 1080, Tick::from_seconds_f64(0.7), &[(vec![glitch], 2e-4)]);
+}
+
+fn curve(pts: &[[f32; 2]]) -> ParamValue {
+    ParamValue::Curve(pts.to_vec())
+}
+
+/// Color Grading's wheels, RGB curves and hue / saturation curves as test parameters.
+fn grade_parts() -> [Vec<(&'static str, ParamValue)>; 3] {
+    [
+        vec![
+            ("wheel_shadows", pt(0.3, -0.2)),
+            ("wheel_midtones", pt(-0.4, 0.1)),
+            ("wheel_highlights", pt(0.2, 0.5)),
+            ("wheel_shadows_l", fl(20.0)),
+            ("wheel_midtones_l", fl(-15.0)),
+            ("wheel_highlights_l", fl(30.0)),
+        ],
+        vec![
+            ("curve_luma", curve(&[[0.0, 0.05], [0.3, 0.2], [0.7, 0.85], [1.0, 0.95]])),
+            ("curve_red", curve(&[[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]])),
+            ("curve_green", curve(&[[0.0, 0.1], [1.0, 0.9]])),
+            ("curve_blue", curve(&[[0.0, 0.0], [0.4, 0.3], [1.0, 1.0]])),
+        ],
+        vec![
+            ("hue_vs_sat", curve(&[[0.1, 0.8], [0.5, 0.3]])),
+            ("hue_vs_hue", curve(&[[0.3, 0.6]])),
+            ("hue_vs_luma", curve(&[[0.6, 0.7]])),
+            ("luma_vs_sat", curve(&[[0.2, 0.9], [0.8, 0.2]])),
+            ("sat_vs_sat", curve(&[[0.5, 0.8]])),
+        ],
+    ]
+}
+
+/// Color Grading beyond its Basic controls: each built-in Look, the Color Wheels, the RGB curves
+/// and the hue / saturation curves, alone, together and between other effects.
+#[test]
+fn gpu_color_grading_looks_wheels_and_curves_match_cpu() {
+    let [wheels, rgb, hue] = grade_parts();
+    let mut chains: Vec<(Vec<EffectInstance>, f32)> =
+        (1..=8).map(|look| (vec![effect("lumetri", &[("look", ch(look)), ("look_intensity", fl(70.0))])], 1e-5)).collect();
+    chains.push((vec![effect("lumetri", &wheels)], 1e-5));
+    chains.push((vec![effect("lumetri", &rgb)], 1e-5));
+    chains.push((vec![effect("lumetri", &hue)], 1e-5));
+    chains.push((vec![effect("lumetri", &[("hue_vs_hue", curve(&[[0.0, 0.9], [0.5, 0.1]]))])], 1e-5));
+    let mut all = vec![("look", ch(1)), ("contrast", fl(25.0)), ("exposure", fl(0.4)), ("vignette_amount", fl(-2.0)), ("vibrance", fl(30.0))];
+    all.extend(wheels);
+    all.extend(rgb);
+    all.extend(hue);
+    let blur = effect("gaussian_blur", &[("blurriness", fl(4.0))]);
+    chains.push((vec![effect("lumetri", &all)], 1e-5));
+    chains.push((vec![blur.clone(), effect("lumetri", &all), blur], 1e-5));
+    for (effects, _) in &chains {
+        let op = FxOp::eval(&effects[effects.len() / 2], &cx(Tick::ZERO, 1.0), 96, 54).expect("op");
+        assert!(matches!(op, FxOp::Seq(_)), "an advanced grade is a sequence of passes");
+    }
+    check_chains(96, 54, Tick::ZERO, &chains);
 }

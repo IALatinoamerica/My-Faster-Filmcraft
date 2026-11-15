@@ -71,6 +71,7 @@ const OP_MIX_BASE: u32 = 110;
 const OP_LENS: u32 = 111;
 const OP_EMBOSS: u32 = 112;
 const OP_GLITCH: u32 = 113;
+const OP_GRADE_ADV: u32 = 114;
 /// `effects::hash3`'s multiplier of the seed (the shader gets the product).
 const NOISE_SEED_MUL: u64 = 0x1656_67B1_9E37_79F9;
 
@@ -477,6 +478,20 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
             }
         }
         FxOp::LensDistortion(l) => out.push(step(OP_LENS, [0; 4], &[l.k as f32, l.cx as f32, l.cy as f32, l.norm as f32])),
+        FxOp::Seq(ops) => out.extend(ops.iter().flat_map(|op| steps(op, w, h))),
+        FxOp::GradeAdvanced(g) => {
+            use filmcraft_render::gpufx_more::{CURVE_IDS, CURVE_N};
+            let wh = g.wheels.unwrap_or_default();
+            let p = [
+                g.look_k, 0.0, 0.0, 0.0, //
+                wh[0][0], wh[0][1], wh[0][2], wh[0][3], //
+                wh[1][0], wh[1][1], wh[1][2], wh[1][3], //
+                wh[2][0], wh[2][1], wh[2][2], wh[2][3],
+            ];
+            let mut s = step(OP_GRADE_ADV, [g.look, g.curves, g.wheels.is_some() as u32, 0], &p);
+            s.table = Some((g.table.clone(), CURVE_N as u32, CURVE_IDS.len() as u32));
+            out.push(s);
+        }
         FxOp::Emboss(m) => out.push(step(OP_EMBOSS, [0; 4], &[m.dx, m.dy, m.contrast, m.blend])),
         FxOp::DigitalGlitch(g) => {
             // (no rows: the effect does nothing)

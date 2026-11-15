@@ -232,6 +232,157 @@ impl DigitalGlitch {
     }
 }
 
+/// Entries of a Color Grading curve table (`effects::lumetri_advanced`'s `N`).
+pub const CURVE_N: usize = 1024;
+/// The curves of [`GradeAdvanced`], in the order of their rows in its table and of the bits of
+/// its `curves` mask.
+pub const CURVE_IDS: [&str; 9] =
+    ["curve_luma", "curve_red", "curve_green", "curve_blue", "hue_vs_sat", "hue_vs_hue", "hue_vs_luma", "luma_vs_sat", "sat_vs_sat"];
+
+/// Color Grading after its Basic controls, as `effects::lumetri_advanced` runs it on an SDR
+/// sequence: the built-in Look (mixed in by `look_k`), the three Color Wheels, the RGB and luma
+/// curves, then the hue and saturation curves in HSL. `table` holds one row of [`CURVE_N`]
+/// entries per curve of [`CURVE_IDS`] (bit `i` of `curves`: curve `i` is in use; unused rows are
+/// zero).
+#[derive(Clone, Debug, PartialEq)]
+pub struct GradeAdvanced {
+    pub look: u32,
+    pub look_k: f32,
+    /// Shadows, midtones, highlights: the wheel's RGB direction and its luminance slider.
+    pub wheels: Option<[[f32; 4]; 3]>,
+    pub curves: u32,
+    pub table: std::sync::Arc<Vec<f32>>,
+}
+
+impl GradeAdvanced {
+    /// None: nothing of it is in use (the CPU returns early).
+    pub(crate) fn eval(e: &EffectInstance, cx: &FxCtx) -> Option<Self> {
+        use crate::effects::{choice, curve_lut, curve_param, hue_lut, is_identity_curve, on, vs_sat_lut, wheel_rgb};
+        let (creative_on, curves_on, wheels_on) = (on(e, "creative_on"), on(e, "curves_on"), on(e, "wheels_on"));
+        let mut table = vec![0f32; CURVE_N * CURVE_IDS.len()];
+        let mut curves = 0u32;
+        for (i, id) in CURVE_IDS.iter().enumerate() {
+            let lut = curve_param(e, id).filter(|_| curves_on).and_then(|c| match i {
+                0..=3 => (!is_identity_curve(&c)).then(|| curve_lut(&c, CURVE_N)),
+                4..=6 => hue_lut(&c, CURVE_N),
+                _ => vs_sat_lut(&c, CURVE_N),
+            });
+            if let (Some(lut), Some(row)) = (lut.filter(|l| l.len() == CURVE_N), table.get_mut(i * CURVE_N..(i + 1) * CURVE_N)) {
+                row.copy_from_slice(&lut);
+                curves |= 1 << i;
+            }
+        }
+        let look = if creative_on { choice(e, "look") } else { 0 };
+        let look_k = f(e, "look_intensity", cx) / 100.0;
+        let v2 = |id: &str| e.param(id).map(|p| p.vec2_at(cx.t)).unwrap_or_default();
+        let l = |id: &str| f(e, id, cx) / 100.0;
+        let wheel = |id: &str, lid: &str| {
+            let c = wheel_rgb(v2(id));
+            [c[0], c[1], c[2], l(lid)]
+        };
+        let w = [wheel("wheel_shadows", "wheel_shadows_l"), wheel("wheel_midtones", "wheel_midtones_l"), wheel("wheel_highlights", "wheel_highlights_l")];
+        let wheels = wheels_on && (w.iter().any(|q| q[..3].iter().any(|v| v.abs() > 1e-5)) || w[0][3].abs() + w[1][3].abs() + w[2][3].abs() > 1e-5);
+        (curves != 0 || look > 0 || wheels).then(|| Self { look, look_k, wheels: wheels.then_some(w), curves, table: std::sync::Arc::new(table) })
+    }
+
+    pub(crate) fn gpu_ok(&self) -> bool {
+        self.look_k.is_finite() && self.wheels.is_none_or(|w| w.iter().all(|q| fin(q))) && self.table.len() == CURVE_N * CURVE_IDS.len() && fin(&self.table)
+    }
+
+    fn curve(&self, i: usize) -> Option<&[f32]> {
+        (self.curves & (1 << i) != 0).then(|| self.table.get(i * CURVE_N..(i + 1) * CURVE_N)).flatten()
+    }
+
+    pub(crate) fn apply(&self, img: &mut Image) {
+        const N: usize = CURVE_N;
+        let sample = |l: &[f32], x: f32| {
+            let p = x.clamp(0.0, 1.0) * (N - 1) as f32;
+            let i = p as usize;
+            let j = (i + 1).min(N - 1);
+            l[i] + (l[j] - l[i]) * (p - i as f32)
+        };
+        let (luma_c, red_c, green_c, blue_c) = (self.curve(0), self.curve(1), self.curve(2), self.curve(3));
+        let (hvs, hvh, hvl, lvs, svs) = (self.curve(4), self.curve(5), self.curve(6), self.curve(7), self.curve(8));
+        let (look, look_k) = (self.look, self.look_k);
+        let wheels = self.wheels;
+        img.map_rgb(|c, _, _| {
+            let mut v = enc(c);
+            if look > 0 {
+                let lk = crate::effects::apply_look(look, v);
+                v = [v[0] + (lk[0] - v[0]) * look_k, v[1] + (lk[1] - v[1]) * look_k, v[2] + (lk[2] - v[2]) * look_k];
+            }
+            if let Some([s, m, h]) = wheels {
+                let l = (0.2126 * v[0] + 0.7152 * v[1] + 0.0722 * v[2]).clamp(0.0, 1.0);
+                let wsh = (1.0 - l).powi(2);
+                let whi = l * l;
+                let wmid = (1.0 - wsh - whi).max(0.0);
+                for k in 0..3 {
+                    v[k] += (s[k] * 0.3 + s[3] * 0.3) * wsh;
+                    v[k] += (m[k] * 0.3 + m[3] * 0.3) * wmid;
+                    v[k] *= 1.0 + (h[k] * 0.5 + h[3] * 0.5) * whi;
+                }
+            }
+            if let Some(l) = luma_c {
+                v = v.map(|q| sample(l, q));
+            }
+            if let Some(l) = red_c {
+                v[0] = sample(l, v[0]);
+            }
+            if let Some(l) = green_c {
+                v[1] = sample(l, v[1]);
+            }
+            if let Some(l) = blue_c {
+                v[2] = sample(l, v[2]);
+            }
+            if hvs.is_some() || hvh.is_some() || hvl.is_some() || lvs.is_some() || svs.is_some() {
+                let u = v.map(|q| q.clamp(0.0, 1.0));
+                let mut h = rgb_to_hsl(u[0], u[1], u[2]);
+                let (h0, s0, l0) = (h[0], h[1], h[2]);
+                if let Some(t) = hvh {
+                    h[0] = (h[0] + (sample(t, h0) - 0.5)).rem_euclid(1.0);
+                }
+                let mut sm = 1.0;
+                if let Some(t) = hvs {
+                    sm *= sample(t, h0) * 2.0;
+                }
+                if let Some(t) = lvs {
+                    sm *= sample(t, l0) * 2.0;
+                }
+                if let Some(t) = svs {
+                    sm *= sample(t, s0) * 2.0;
+                }
+                h[1] = (h[1] * sm).clamp(0.0, 1.0);
+                if let Some(t) = hvl {
+                    h[2] = (h[2] + (sample(t, h0) - 0.5) * 0.5).clamp(0.0, 1.0);
+                }
+                v = hsl_to_rgb(h[0], h[1], h[2]);
+            }
+            dec(v)
+        });
+    }
+}
+
+/// Color Grading with more than its Basic, Creative and Vignette controls in use on an SDR
+/// sequence: `basic` (the [`FxOp::Lumetri`] `eval` made, which declines such a grade) followed by
+/// the passes of the rest, as `effects::lumetri` runs them one after the other. What has no pass
+/// yet leaves `basic` as it came, so the CPU renders the effect.
+pub(crate) fn grade(e: &EffectInstance, cx: &FxCtx, mut basic: crate::gpufx::FxOp) -> crate::gpufx::FxOp {
+    use crate::effects::{on, text};
+    use crate::gpufx::FxOp;
+    let (basic_on, creative_on) = (on(e, "basic_on"), on(e, "creative_on"));
+    let input_lut = basic_on && !text(e, "input_lut").is_empty();
+    let look_lut = creative_on && !text(e, "look_lut").is_empty();
+    let sharpen = creative_on && (f(e, "sharpen", cx) / 100.0).abs() > 1e-3;
+    if input_lut || look_lut || sharpen || b(e, "hsl_on") {
+        return basic;
+    }
+    let FxOp::Lumetri { gpu_capable, .. } = &mut basic else { return basic };
+    *gpu_capable = true;
+    let mut ops = vec![basic];
+    ops.extend(GradeAdvanced::eval(e, cx).map(|a| FxOp::GradeAdvanced(Box::new(a))));
+    FxOp::Seq(ops)
+}
+
 /// Rounded Crop: the rectangle `x0..x1` × `y0..y1` with corner radius `rad`, an inward `feather`
 /// (0: a one-pixel edge) and a `border` band of colour `bc` (linear) inside the edge.
 #[derive(Clone, Debug, PartialEq)]
@@ -626,9 +777,56 @@ mod tests {
         ParamValue::Float(v)
     }
 
+    /// Color Grading with more than its Basic controls in use.
+    fn grades() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>)> {
+        let curve = |pts: &[[f32; 2]]| ParamValue::Curve(pts.to_vec());
+        let v2 = |x: f64, y: f64| ParamValue::Vec2(filmcraft_geom::Vec2::new(x, y));
+        let wheels = vec![
+            ("wheel_shadows", v2(0.3, -0.2)),
+            ("wheel_midtones", v2(-0.4, 0.1)),
+            ("wheel_highlights", v2(0.2, 0.5)),
+            ("wheel_shadows_l", fl(20.0)),
+            ("wheel_midtones_l", fl(-15.0)),
+            ("wheel_highlights_l", fl(30.0)),
+        ];
+        let rgb = vec![
+            ("curve_luma", curve(&[[0.0, 0.05], [0.3, 0.2], [0.7, 0.85], [1.0, 0.95]])),
+            ("curve_red", curve(&[[0.0, 0.0], [0.5, 0.6], [1.0, 1.0]])),
+            ("curve_green", curve(&[[0.0, 0.1], [1.0, 0.9]])),
+            ("curve_blue", curve(&[[0.0, 0.0], [0.4, 0.3], [1.0, 1.0]])),
+        ];
+        let hue = vec![
+            ("hue_vs_sat", curve(&[[0.1, 0.8], [0.5, 0.3]])),
+            ("hue_vs_hue", curve(&[[0.3, 0.6]])),
+            ("hue_vs_luma", curve(&[[0.6, 0.7]])),
+            ("luma_vs_sat", curve(&[[0.2, 0.9], [0.8, 0.2]])),
+            ("sat_vs_sat", curve(&[[0.5, 0.8]])),
+        ];
+        let mut out: Vec<(&'static str, Vec<(&'static str, ParamValue)>)> =
+            (1..=8).map(|look| ("lumetri", vec![("look", ParamValue::Choice(look)), ("look_intensity", fl(70.0))])).collect();
+        out.push(("lumetri", wheels.clone()));
+        out.push(("lumetri", vec![("wheel_midtones_l", fl(40.0))]));
+        out.push(("lumetri", rgb.clone()));
+        out.push(("lumetri", hue.clone()));
+        out.push(("lumetri", vec![("hue_vs_hue", curve(&[[0.0, 0.9], [0.5, 0.1]]))]));
+        let mut all =
+            vec![("look", ParamValue::Choice(1)), ("contrast", fl(25.0)), ("exposure", fl(0.4)), ("vignette_amount", fl(-2.0)), ("vibrance", fl(30.0))];
+        all.extend(wheels);
+        all.extend(rgb);
+        all.extend(hue);
+        out.push(("lumetri", all));
+        out
+    }
+
     pub(crate) fn cases() -> Vec<(&'static str, Vec<(&'static str, ParamValue)>)> {
         let green = ParamValue::Color([0.0, 1.0, 0.0, 1.0]);
         let custom = ParamValue::Choice(3);
+        let mut out = grades();
+        out.extend(more_cases(green, custom));
+        out
+    }
+
+    fn more_cases(green: ParamValue, custom: ParamValue) -> Vec<(&'static str, Vec<(&'static str, ParamValue)>)> {
         vec![
             ("emboss", vec![]),
             ("emboss", vec![("direction", fl(110.0)), ("relief", fl(3.5)), ("contrast", fl(160.0)), ("blend", fl(35.0))]),

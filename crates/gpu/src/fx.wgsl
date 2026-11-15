@@ -71,6 +71,7 @@ const OP_MIX_BASE: u32 = 110u;
 const OP_LENS: u32 = 111u;
 const OP_EMBOSS: u32 = 112u;
 const OP_GLITCH: u32 = 113u;
+const OP_GRADE_ADV: u32 = 114u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -769,6 +770,116 @@ fn key_matte(o: vec4<f32>) -> f32 {
     return clamp((clamp(m, 0.0, 1.0) - u.p2.x) / (1.0 - u.p2.x), 0.0, 1.0);
 }
 
+// Color Grading's curve `row` of the table at `x` (`lumetri_advanced`'s `sample`: 1024 entries
+// over 0..1, linear between them).
+fn curve_at(row: i32, x: f32) -> f32 {
+    let q = clamp(x, 0.0, 1.0) * 1023.0;
+    let i = i32(q);
+    let j = min(i + 1, 1023);
+    let a = textureLoad(tbl, vec2(i, row), 0).r;
+    let b = textureLoad(tbl, vec2(j, row), 0).r;
+    return a + (b - a) * (q - f32(i));
+}
+
+fn look_curve(v: vec3<f32>, k: f32) -> vec3<f32> {
+    let x = clamp(v, vec3(0.0), vec3(1.0));
+    return x + (x * x * (vec3(3.0) - 2.0 * x) - x) * k;
+}
+
+// `effects::apply_look`: the built-in Looks on the display-encoded colour.
+fn apply_look(look: u32, c: vec3<f32>) -> vec3<f32> {
+    let l = 0.2126 * c.x + 0.7152 * c.y + 0.0722 * c.z;
+    let g = vec3(l);
+    switch look {
+        case 1u: {
+            let shadow = vec3(0.0, 0.08, 0.1);
+            let high = vec3(0.1, 0.04, -0.06);
+            return look_curve(c + shadow * (1.0 - l) + high * l, 0.35);
+        }
+        case 2u: {
+            let d = vec3(c.x * 1.06 + 0.02, c.y * 1.0 + 0.01, c.z * 0.9);
+            return (d + (g - d) * 0.15) * 0.94 + vec3(0.04);
+        }
+        case 3u: {
+            return look_curve(vec3(c.x * 0.9, c.y * 0.98, c.z * 1.1 + 0.02), 0.2);
+        }
+        case 4u: {
+            return look_curve(c + (g - c) * 0.55, 0.6);
+        }
+        case 5u: {
+            return vec3(0.08) + (c + (g - c) * 0.25) * 0.84;
+        }
+        case 6u: {
+            return look_curve(g, 0.3);
+        }
+        case 7u: {
+            return look_curve(vec3(c.x * 1.1 + 0.03, c.y * 1.02 + 0.01, c.z * 0.82), 0.15);
+        }
+        case 8u: {
+            return vec3(c.x * 0.75, c.y * 0.85, c.z * 1.15) * 0.8;
+        }
+        default: {
+            return c;
+        }
+    }
+}
+
+// `gpufx_more::GradeAdvanced::apply` on a straight linear colour: i1 = (look, curve mask, wheels
+// in use), p0.x = look intensity, p1..p3 = shadows / midtones / highlights (wheel RGB, luminance).
+fn grade_advanced(c: vec3<f32>) -> vec3<f32> {
+    var v = enc(c);
+    if u.i1.x > 0u {
+        v = v + (apply_look(u.i1.x, v) - v) * u.p0.x;
+    }
+    if u.i1.z != 0u {
+        let l = clamp(0.2126 * v.x + 0.7152 * v.y + 0.0722 * v.z, 0.0, 1.0);
+        let wsh = (1.0 - l) * (1.0 - l);
+        let whi = l * l;
+        let wmid = max(1.0 - wsh - whi, 0.0);
+        v = v + (u.p1.xyz * 0.3 + vec3(u.p1.w * 0.3)) * wsh;
+        v = v + (u.p2.xyz * 0.3 + vec3(u.p2.w * 0.3)) * wmid;
+        v = v * (vec3(1.0) + (u.p3.xyz * 0.5 + vec3(u.p3.w * 0.5)) * whi);
+    }
+    let m = u.i1.y;
+    if (m & 1u) != 0u {
+        v = vec3(curve_at(0, v.x), curve_at(0, v.y), curve_at(0, v.z));
+    }
+    if (m & 2u) != 0u {
+        v.x = curve_at(1, v.x);
+    }
+    if (m & 4u) != 0u {
+        v.y = curve_at(2, v.y);
+    }
+    if (m & 8u) != 0u {
+        v.z = curve_at(3, v.z);
+    }
+    if (m & 0x1F0u) != 0u {
+        var h = rgb_to_hsl(clamp(v, vec3(0.0), vec3(1.0)));
+        let h0 = h.x;
+        let s0 = h.y;
+        let l0 = h.z;
+        if (m & 32u) != 0u {
+            h.x = fract_euclid(h.x + (curve_at(5, h0) - 0.5));
+        }
+        var sm = 1.0;
+        if (m & 16u) != 0u {
+            sm = sm * (curve_at(4, h0) * 2.0);
+        }
+        if (m & 128u) != 0u {
+            sm = sm * (curve_at(7, l0) * 2.0);
+        }
+        if (m & 256u) != 0u {
+            sm = sm * (curve_at(8, s0) * 2.0);
+        }
+        h.y = clamp(h.y * sm, 0.0, 1.0);
+        if (m & 64u) != 0u {
+            h.z = clamp(h.z + (curve_at(6, h0) - 0.5) * 0.5, 0.0, 1.0);
+        }
+        v = hsl_to_rgb(h.x, h.y, h.z);
+    }
+    return dec(v);
+}
+
 // The picture `shift` pixels to the right of `p`, bilinear between the two texels of its row,
 // wrapping around sideways (`vfx::immersive`'s `sample_wrap` at a pixel centre).
 fn glitch_read(p: vec2<i32>, shift: f32) -> vec4<f32> {
@@ -942,6 +1053,13 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             let na = a * o.a;
             return vec4(l * na, na);
+        }
+        case OP_GRADE_ADV: {
+            let o = ld(p);
+            if o.a <= 1e-6 {
+                return o;
+            }
+            return vec4(grade_advanced(o.rgb / o.a) * o.a, o.a);
         }
         case OP_EMBOSS: {
             // p0 = (dx, dy, contrast, blend)

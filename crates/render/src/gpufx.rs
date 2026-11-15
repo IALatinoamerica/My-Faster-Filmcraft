@@ -256,6 +256,10 @@ pub enum FxOp {
     UltraKey(crate::gpufx_more::UltraKey),
     LensDistortion(crate::gpufx_more::LensDistortion),
     Emboss(crate::gpufx_more::Emboss),
+    /// Several ops in a row that one effect evaluates to (Color Grading beyond its Basic
+    /// controls).
+    Seq(Vec<FxOp>),
+    GradeAdvanced(Box<crate::gpufx_more::GradeAdvanced>),
     DigitalGlitch(crate::gpufx_more::DigitalGlitch),
 }
 
@@ -728,7 +732,7 @@ impl FxOp {
                 let gains = [1.0 + 0.35 * temp, 1.0 - 0.3 * tint, 1.0 - 0.35 * temp];
                 let aspect = if h > 0 { (w as f32 / h as f32).max(1e-4) } else { 1.0 };
 
-                FxOp::Lumetri {
+                let basic = FxOp::Lumetri {
                     gains,
                     exposure,
                     contrast,
@@ -749,7 +753,9 @@ impl FxOp {
                     vfeather,
                     aspect,
                     gpu_capable,
-                }
+                };
+                // the rest of an SDR grade has passes of its own
+                if gpu_capable || is_hdr { basic } else { crate::gpufx_more::grade(e, cx, basic) }
             }
             _ => return None,
         })
@@ -812,6 +818,8 @@ impl FxOp {
             FxOp::UltraKey(k) => k.gpu_ok(),
             FxOp::LensDistortion(l) => l.gpu_ok(),
             FxOp::Emboss(m) => m.gpu_ok(),
+            FxOp::Seq(ops) => ops.iter().all(FxOp::gpu_ok),
+            FxOp::GradeAdvanced(g) => g.gpu_ok(),
             FxOp::DigitalGlitch(g) => g.gpu_ok(),
         }
     }
@@ -1136,6 +1144,8 @@ impl FxOp {
             FxOp::UltraKey(k) => k.apply(img),
             FxOp::LensDistortion(l) => l.apply(img),
             FxOp::Emboss(m) => m.apply(img),
+            FxOp::Seq(ops) => ops.iter().for_each(|op| op.apply(img)),
+            FxOp::GradeAdvanced(g) => g.apply(img),
             FxOp::DigitalGlitch(g) => g.apply(img),
             FxOp::Mask { cov } => {
                 if cov.len().checked_mul(4) == Some(img.px.len()) {
