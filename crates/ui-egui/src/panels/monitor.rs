@@ -75,7 +75,11 @@ fn draw_picture(app: &mut FilmcraftApp, ui: &mut egui::Ui, which: Which, mv: &cr
     let live = grid || display == DisplayMode::Alpha;
     let cpu_target = target;
     let target = match (app.gpu.as_ref().filter(|_| use_gpu), target) {
-        (Some(g), Target::Sequence(s)) => Target::SequencePlan(s, g.compositor.caps()),
+        (Some(g), Target::Sequence(s)) => {
+            // the report of what renders on the CPU and the render bar ask for this device
+            filmcraft_render::plan::note_device(g.compositor.caps());
+            Target::SequencePlan(s, g.compositor.caps())
+        }
         (None, Target::Sequence(s)) if live => Target::SequenceLive(s),
         (_, t) => t,
     };

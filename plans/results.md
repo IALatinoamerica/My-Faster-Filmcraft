@@ -90,3 +90,24 @@ Checks run: `cargo fmt`; clippy with warnings as errors on `filmcraft-render`, `
 `filmcraft-ui-egui`; tests of `filmcraft-render` (286 pass), `filmcraft-gpu` (64 pass, 4 ignored)
 and `filmcraft-ui-egui --lib` (358 pass). No upstream test asserted the old behaviour, so none
 was changed. Not run: `cargo xtask ci`; no visual check in the app.
+
+## Round 3, stage 2: the report of what renders on the CPU
+
+`sequence.cpuReport` (engine command; `filmcraft_render::slow_paths`), run read-only through
+`filmcraft-cli --project <file> exec sequence.cpuReport` on 2026-11-15. It decodes nothing; each
+run took under 0.1 s including opening the project.
+
+| Project, sequence | Entries | Whole-frame | What it lists |
+|---|---|---|---|
+| `FULL TEST 02`, `EDIT_PR_282 News Nov 02` | 0 | 0 | nothing: the GPU draws the whole sequence |
+| `FULL TEST 02`, the sequence the project opens on | 4 | 0 | 4 titles with effects or opacity masks (track 4) |
+| `FX Color Grading Masked ADJ`, `EDIT_PR_282 News Nov 02` | 0 | 0 | nothing (stage 1) |
+| `FX Twirl ADJ`, the sequence it opens on | 2 | 1 | the adjustment layer with Twirl (track 6, whole frame); 1 title |
+| `FX Twirl CAM`, the sequence it opens on | 56 | 0 | 55 clips with Twirl (track 3); 1 title |
+
+Checks run: `cargo fmt`; clippy with warnings as errors on `filmcraft-render`, `filmcraft-gpu`,
+`filmcraft-engine` and `filmcraft-ui-egui`; tests of `filmcraft-render` (289 pass),
+`filmcraft-gpu` (64 pass), `filmcraft-ui-egui --lib` (358 pass) and `filmcraft-engine --lib`
+(905 pass, 1 fails: `every_builtin_preset_exports_and_ffprobe_confirms`, at "APV 422-10"; it
+fails the same way without this stage's changes, the local `ffprobe` does not report that codec).
+Not run: `cargo xtask ci`.

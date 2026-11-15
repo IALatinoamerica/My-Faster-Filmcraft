@@ -32,6 +32,7 @@ pub mod plan;
 pub mod preview;
 pub mod remix;
 pub mod scene;
+pub mod slow_paths;
 mod stretch;
 pub mod track;
 pub mod transitions;

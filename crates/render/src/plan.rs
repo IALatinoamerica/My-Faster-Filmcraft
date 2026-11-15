@@ -133,6 +133,22 @@ impl DeviceCaps {
     }
 }
 
+/// The capabilities of the device that composites this process's monitors, once known
+/// ([`note_device`]); `u64::MAX` until then.
+static DEVICE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Records what the device that composites the monitors runs, for callers that cannot see it:
+/// the report of what renders on the CPU and the render bar ([`noted_device`]).
+pub fn note_device(caps: DeviceCaps) {
+    DEVICE.store(caps.adjust_side as u64, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The device [`note_device`] recorded. None before any monitor has composited a frame (a
+/// headless session): a caller then assumes a device that runs every step ([`DeviceCaps::ALL`]).
+pub fn noted_device() -> Option<DeviceCaps> {
+    u32::try_from(DEVICE.load(std::sync::atomic::Ordering::Relaxed)).ok().map(|adjust_side| DeviceCaps { adjust_side })
+}
+
 #[derive(Default)]
 struct PlanStack {
     steps: Vec<PlanStep>,
@@ -245,15 +261,28 @@ fn cpu_frame(img: crate::Image) -> Arc<VideoFrame> {
     Arc::new(VideoFrame::rgba_f32(img.w as u32, img.h as u32, img.px))
 }
 
-fn simple_transition(id: &str) -> bool {
+pub(crate) fn simple_transition(id: &str) -> bool {
     matches!(id, "cross_dissolve" | "dip_to_black" | "dip_to_white")
+}
+
+/// Why the frames of transition `trn` on track `tr` render on the CPU, whole: the compositor
+/// mixes only the dissolves and Push itself, and none into or out of an adjustment layer. None:
+/// the transition is planned as layers.
+pub(crate) fn transition_cpu(project: &Project, tr: &filmcraft_project::Track, trn: &filmcraft_project::Transition) -> Option<&'static str> {
+    if !simple_transition(&trn.effect.effect) && trn.effect.effect != "push" {
+        return Some("this transition has no GPU version");
+    }
+    if [trn.from, trn.to].into_iter().flatten().filter_map(|c| tr.item(c)).any(|it| is_adjustment(project, it)) {
+        return Some("a transition into or out of an adjustment layer");
+    }
+    None
 }
 
 /// The standard effects of a media clip if the GPU can draw it (any blend mode, every enabled
 /// standard effect with a GPU implementation; empty without effects or with effects off). None:
 /// the clip is rendered on the CPU. An effect's own masks wrap its op ([`masked_op`]); opacity
 /// masks are the last op of the effect stage ([`opacity_mask_op`]).
-fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
+pub(crate) fn gpu_chain<'a>(project: &Project, item: &'a TrackItem, opts: RenderOptions) -> Option<Vec<&'a filmcraft_project::EffectInstance>> {
     let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
     if !is_media {
         return None;
@@ -439,33 +468,12 @@ fn is_adjustment(project: &Project, it: &TrackItem) -> bool {
 /// CPU). None sends the frame to the CPU. [`layered_at`] and [`push_adjustment`] both ask this, so
 /// [`is_cpu_frame`] knows which frames plan as one CPU image.
 fn adjustment_ops(project: &Project, seq: &Sequence, it: &TrackItem, t: Tick, scale: f32, caps: DeviceCaps) -> Option<Vec<FxOp>> {
+    let fx = adjustment_fx(project, seq, it, t, scale, caps).ok()?;
     let mt = it.effect_time_at(t);
-    let (op, bl) = crate::opacity_blend(it, mt);
+    let (op, _) = crate::opacity_blend(it, mt);
     let (w, h) = output_size(seq, scale);
-    if !caps.adjusts(w, h) || bl != Blend::Normal || !op.is_finite() {
-        return None;
-    }
-    let cx = crate::effects::FxCtx {
-        t: mt,
-        px_scale: scale,
-        mask_scale: scale,
-        seconds: (t - it.start).seconds(),
-        timecode: "",
-        clip_name: &it.name,
-        project: Some(project),
-        env: None,
-        frame_rate: seq.settings.frame_rate.as_f64(),
-        working: seq.settings.color.working,
-    };
-    let mut ops: Vec<FxOp> = it
-        .effects
-        .iter()
-        .filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic))
-        .map(|e| {
-            let gpu = crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str());
-            if gpu { FxOp::eval(e, &cx, w, h).filter(FxOp::gpu_ok).map(|op| masked_op(e, op, &cx, w, h)) } else { None }
-        })
-        .collect::<Option<_>>()?;
+    let cx = adjustment_cx(project, seq, it, t, scale);
+    let mut ops: Vec<FxOp> = fx.into_iter().map(|(e, op)| masked_op(e, op, &cx, w, h)).collect();
     // a layer that is not opaque, is masked or does not cover the frame keeps part of the picture
     // below it
     if !ops.is_empty() {
@@ -477,6 +485,73 @@ fn adjustment_ops(project: &Project, seq: &Sequence, it: &TrackItem, t: Tick, sc
         }
     }
     Some(ops)
+}
+
+/// Why an adjustment layer sends its frames to the CPU ([`adjustment_fx`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AdjustmentCpu {
+    /// The device runs no adjustment layers on a frame of this size.
+    Device,
+    /// A blend mode other than Normal.
+    Blend,
+    /// An opacity that is not a number.
+    Opacity,
+    /// The effect at this index of the item's effects has no GPU version, or the GPU declines it
+    /// with these settings.
+    Effect(usize),
+}
+
+/// The effect context of an adjustment layer at `t` and render `scale`, as `adjustment_layer`
+/// builds it on the CPU.
+fn adjustment_cx<'a>(project: &'a Project, seq: &Sequence, it: &'a TrackItem, t: Tick, scale: f32) -> crate::effects::FxCtx<'a> {
+    crate::effects::FxCtx {
+        t: it.effect_time_at(t),
+        px_scale: scale,
+        mask_scale: scale,
+        seconds: (t - it.start).seconds(),
+        timecode: "",
+        clip_name: &it.name,
+        project: Some(project),
+        env: None,
+        frame_rate: seq.settings.frame_rate.as_f64(),
+        working: seq.settings.color.working,
+    }
+}
+
+/// Whether the device can run the adjustment layer `it` at `t`: its enabled standard effects
+/// with their ops, or why not. This is the decision alone: it rasterises no mask and builds no
+/// weight plane ([`adjustment_ops`] does), so [`layered_at`], the report of what renders on the
+/// CPU and the render bar can ask it for every clip of a sequence.
+pub(crate) fn adjustment_fx<'a>(
+    project: &'a Project,
+    seq: &Sequence,
+    it: &'a TrackItem,
+    t: Tick,
+    scale: f32,
+    caps: DeviceCaps,
+) -> Result<Vec<(&'a filmcraft_project::EffectInstance, FxOp)>, AdjustmentCpu> {
+    let (op, bl) = crate::opacity_blend(it, it.effect_time_at(t));
+    let (w, h) = output_size(seq, scale);
+    if !caps.adjusts(w, h) {
+        return Err(AdjustmentCpu::Device);
+    }
+    if bl != Blend::Normal {
+        return Err(AdjustmentCpu::Blend);
+    }
+    if !op.is_finite() {
+        return Err(AdjustmentCpu::Opacity);
+    }
+    let cx = adjustment_cx(project, seq, it, t, scale);
+    it.effects
+        .iter()
+        .enumerate()
+        .filter(|(_, e)| e.enabled && e.def().is_some_and(|d| !d.intrinsic))
+        .map(|(i, e)| {
+            let gpu = crate::gpufx::GPU_EFFECTS.contains(&e.effect.as_str());
+            let op = if gpu { FxOp::eval(e, &cx, w, h).filter(FxOp::gpu_ok) } else { None };
+            op.map(|op| (e, op)).ok_or(AdjustmentCpu::Effect(i))
+        })
+        .collect()
 }
 
 /// What decides an adjustment layer's weight plane: its opacity masks flattened for the output,
@@ -530,18 +605,15 @@ pub(crate) fn layered_at(project: &Project, seq: &Sequence, t: Tick, scale: f32,
         if !tr.enabled {
             continue;
         }
-        if let Some(trn) = tr.transitions.iter().find(|x| x.range().contains(t)) {
-            if !simple_transition(&trn.effect.effect) && trn.effect.effect != "push" {
-                return false;
-            }
-            if [trn.from, trn.to].into_iter().flatten().filter_map(|c| tr.item(c)).any(adjustment) {
-                return false;
-            }
+        if let Some(trn) = tr.transitions.iter().find(|x| x.range().contains(t))
+            && transition_cpu(project, tr, trn).is_some()
+        {
+            return false;
         }
         if let Some(it) = tr.item_at(t)
             && it.enabled
             && adjustment(it)
-            && adjustment_ops(project, seq, it, t, scale, caps).is_none()
+            && adjustment_fx(project, seq, it, t, scale, caps).is_err()
         {
             return false;
         }
@@ -638,7 +710,7 @@ fn push_tracks(sc: Scene, layers: &mut PlanStack) {
 /// they all blend Normal, and the frame must be one that plans as layers in the same colour
 /// pipeline. An adjustment layer inside it would adjust the outer tracks below too, so it keeps
 /// the nested sequence on the CPU.
-fn nest_is_plain(project: &Project, seq: &Sequence, nested: &Sequence, ft: Tick, scale: f32, caps: DeviceCaps) -> bool {
+pub(crate) fn nest_is_plain(project: &Project, seq: &Sequence, nested: &Sequence, ft: Tick, scale: f32, caps: DeviceCaps) -> bool {
     nested.settings.color == seq.settings.color
         && (nested.settings.width, nested.settings.height) == (seq.settings.width, seq.settings.height)
         && layered_at(project, nested, ft, scale, caps)
@@ -840,7 +912,7 @@ pub fn quarter_turns(q: u8, w: f64, h: f64) -> Affine {
     }
 }
 
-fn near_identity(m: &Affine) -> bool {
+pub(crate) fn near_identity(m: &Affine) -> bool {
     (m.a - 1.0).abs() < 1e-9 && (m.d - 1.0).abs() < 1e-9 && m.b.abs() < 1e-9 && m.c.abs() < 1e-9 && m.e.abs() < 1e-6 && m.f.abs() < 1e-6
 }
 

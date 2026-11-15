@@ -2947,6 +2947,7 @@ fn build() -> Vec<CommandSpec> {
             crate::previews::delete(s, true)
         }),
         query!("sequence.renderBar", "Render Bar", "{}", |s, _| crate::previews::bar_json(s)),
+        query!("sequence.cpuReport", "CPU Report", r#"{"item":id?,"start":ticks?,"end":ticks?}"#, |s, p| crate::previews::cpu_report_json(s, p)),
         // ================= Work area bar =================
         cmd!("sequence.workAreaBar", "Work Area Bar", [], None, r#"{"show":bool?}"#, has_seq, |s, p| {
             let shown = s.active_sequence().ok_or(EngineError::NoSequence)?.work_area.is_some();

@@ -947,6 +947,53 @@ pub fn delete(s: &mut Session, in_to_out: bool) -> Result<Value> {
     Ok(json!({"deleted": n}))
 }
 
+/// `sequence.cpuReport`: what renders on the CPU in a sequence (the active one, or `item`)
+/// between `start` and `end` (ticks; the whole sequence by default), found without decoding
+/// (`filmcraft_render::slow_paths`). `device` says whose capabilities were asked about: the
+/// device that composites the monitors (`actual`), or, before any monitor has drawn a frame, one
+/// that runs every step (`assumed`).
+pub fn cpu_report_json(s: &Session, p: &Value) -> Result<Value> {
+    const CMD: &str = "sequence.cpuReport";
+    let bad = |m: &str| crate::commands::bad(CMD, m);
+    let seq_id = match p.get("item") {
+        None | Some(Value::Null) => s.state.active_sequence.ok_or(EngineError::NoSequence)?,
+        Some(v) => ItemId(v.as_u64().ok_or_else(|| bad("`item` is a sequence id"))?),
+    };
+    let seq = s.project.sequence(seq_id).ok_or_else(|| bad("not a sequence"))?;
+    let tick = |k: &str| match p.get(k) {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => v.as_i64().map(|t| Some(Tick(t))).ok_or_else(|| bad("`start` and `end` are ticks")),
+    };
+    let start = tick("start")?.unwrap_or(Tick::ZERO).max(Tick::ZERO);
+    let end = tick("end")?.unwrap_or_else(|| seq.duration()).min(seq.duration());
+    if end < start {
+        return Err(bad("`end` is before `start`"));
+    }
+    let noted = filmcraft_render::plan::noted_device();
+    let caps = noted.unwrap_or(filmcraft_render::plan::DeviceCaps::ALL);
+    let list = filmcraft_render::slow_paths::slow_paths(&s.project, seq_id, start, end, caps);
+    let (rate, df) = (seq.settings.frame_rate, seq.settings.drop_frame);
+    let tc = |t: Tick| filmcraft_time::format_time(t, rate, df, filmcraft_time::TimeDisplay::Timecode, seq.settings.sample_rate as i64);
+    Ok(json!({
+        "sequence": seq_id.0,
+        "start": start.0,
+        "end": end.0,
+        "device": if noted.is_some() { "actual" } else { "assumed" },
+        "count": list.len(),
+        "wholeFrameCount": list.iter().filter(|e| e.whole_frame).count(),
+        "entries": list.iter().map(|e| json!({
+            "track": e.track,
+            "name": e.name,
+            "start": e.start.0,
+            "end": e.end.0,
+            "startTimecode": tc(e.start),
+            "endTimecode": tc(e.end),
+            "reason": e.reason,
+            "wholeFrame": e.whole_frame,
+        })).collect::<Vec<_>>(),
+    }))
+}
+
 /// The render bar of the active sequence as JSON (for agents and tests).
 pub fn bar_json(s: &Session) -> Result<Value> {
     let seq = s.state.active_sequence.ok_or(EngineError::NoSequence)?;

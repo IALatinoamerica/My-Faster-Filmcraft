@@ -175,6 +175,17 @@ covers every clip. The edit is the same either way. From Bin starts each clip at
 no media outside its range, so there a kept In is moved to the subclip's first or last frame, and
 the result's `sourceInClamped: [ids]` (present with `keepSourceIn`) names the clips it was moved for.
 
+**What renders on the CPU** (`crates/engine/src/previews.rs`, this fork):
+`sequence.cpuReport {item?, start?, end?}` lists the clips, adjustment layers and transitions of a
+sequence (the active one by default; `start` / `end` in ticks, the whole sequence by default) that
+the GPU compositor does not draw, without decoding anything: `{sequence, start, end, device,
+count, wholeFrameCount, entries: [{track, name, start, end, startTimecode, endTimecode, reason,
+wholeFrame}]}`. `track` counts video tracks from 1 at the bottom (0: the sequence itself);
+`wholeFrame` says every frame of that part renders on the CPU, not just that layer. `device` is
+`actual` when the monitors have composited a frame (the report asks about that device) and
+`assumed` in a session that has not (it then assumes a device that runs every step). An empty
+list means the whole range is drawn by the GPU.
+
 **Colour** (`crates/engine/src/color.rs`): `sequence.colorSettings {workingSpace: rec709|rec2100-pq|
 rec2100-hlg, wideGamut, autoToneMap}`, `clip.interpretFootage {items?, colorSpace?: auto|<id>, pixelAspect?: [num, den]|file}`,
 `color.spaces`, `media.colorInfo {item}`; LUTs: `lut.import {path, name?}`, `lut.list`,

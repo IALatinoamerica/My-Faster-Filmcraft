@@ -1021,3 +1021,164 @@ fn switched_off_and_hostile_effect_masks_plan_without_panicking() {
         }
     }
 }
+
+/// A two-track scene: the ocean on V1 and an adjustment layer with Invert on V2.
+fn ocean_under_adjustment() -> (Scene, ClipId, ClipId) {
+    let mut s = scene(2);
+    let ocean = media(&mut s.p, &mut s.map, GeneratorSource::demo(DemoScene::OceanSunset));
+    let below = place(&mut s.p, s.seq, 0, ocean);
+    let adj = adjustment(&mut s.p, s.seq, 1);
+    fx(&mut s, adj, "invert");
+    (s, below, adj)
+}
+
+fn report(s: &Scene) -> Vec<crate::slow_paths::SlowPath> {
+    crate::slow_paths::slow_paths(&s.p, s.seq, Tick::ZERO, R.tick_of(48), crate::plan::DeviceCaps::ALL)
+}
+
+/// The report of what renders on the CPU lists nothing for a sequence the GPU draws whole, masked
+/// effects and moved adjustment layers included.
+#[test]
+fn the_cpu_report_is_empty_for_a_sequence_the_gpu_draws() {
+    let (mut s, below, adj) = ocean_under_adjustment();
+    fx(&mut s, below, "gaussian_blur");
+    fx(&mut s, adj, "lumetri");
+    grade_everything(&mut s, adj);
+    for c in [below, adj] {
+        let e = clip(&mut s, c).effects.iter_mut().find(|e| e.def().is_some_and(|d| !d.intrinsic)).unwrap();
+        e.masks.push(Mask::new("m", MaskPath::rect(20.0, 20.0, 200.0, 120.0)));
+    }
+    set(&mut s, adj, "motion", "position", ParamValue::Vec2(filmcraft_geom::Vec2::new(170.0, 96.0)));
+    set(&mut s, adj, "opacity", "opacity", ParamValue::Float(60.0));
+    assert_eq!(report(&s), Vec::new());
+    for f in [0, 24, 47] {
+        assert!(!crate::plan::is_cpu_frame(&s.p, s.seq, R.tick_of(f), RenderOptions::default(), crate::plan::DeviceCaps::ALL), "frame {f}");
+    }
+}
+
+/// Each thing that renders on the CPU is listed with its track, its part of the timeline, a
+/// reason that names it, and whether it takes the whole frame; a whole-frame entry agrees with
+/// the planner (`is_cpu_frame`) at the times the report asked about.
+#[test]
+fn the_cpu_report_names_what_renders_on_the_cpu() {
+    use crate::plan::{DeviceCaps, is_cpu_frame};
+    let multiply = filmcraft_project::effect::BLEND_MODES.iter().position(|b| *b == "Multiply").unwrap() as u32;
+    // (what, the change, the track listed, whole frame, words the reason has)
+    type Change = Box<dyn Fn(&mut Scene, ClipId, ClipId)>;
+    let cases: Vec<(&str, Change, usize, bool, &[&str])> = vec![
+        (
+            "an effect without a GPU version on the adjustment layer",
+            Box::new(|s, _, a| fx(s, a, "twirl")),
+            2,
+            true,
+            &["Twirl", "no GPU version", "every frame"],
+        ),
+        ("the same effect on the clip", Box::new(|s, c, _| fx(s, c, "twirl")), 1, false, &["Twirl", "no GPU version", "this clip"]),
+        (
+            "a Transform the GPU declines",
+            Box::new(|s, _, a| {
+                fx(s, a, "transform");
+                set(s, a, "transform", "scale_height", ParamValue::Float(40.0));
+            }),
+            2,
+            true,
+            &["Transform", "these settings"],
+        ),
+        (
+            "the same Transform on the clip",
+            Box::new(|s, c, _| {
+                fx(s, c, "transform");
+                set(s, c, "transform", "scale_height", ParamValue::Float(40.0));
+            }),
+            1,
+            false,
+            &["Transform", "these settings"],
+        ),
+        ("Multiply on the adjustment layer", Box::new(move |s, _, a| set(s, a, "opacity", "blend", ParamValue::Choice(multiply))), 2, true, &["blend mode"]),
+        (
+            "Frame Blending on a clip at another speed",
+            Box::new(|s, c, _| {
+                let it = clip(s, c);
+                it.speed = 2.0;
+                it.time_interpolation = filmcraft_project::TimeInterpolation::FrameBlending;
+            }),
+            1,
+            false,
+            &["Frame Blending"],
+        ),
+    ];
+    for (what, change, track, whole, words) in &cases {
+        let (mut s, below, adj) = ocean_under_adjustment();
+        change(&mut s, below, adj);
+        let list = report(&s);
+        let [p] = list.as_slice() else { panic!("{what}: {list:?}") };
+        assert_eq!((p.track, p.whole_frame), (*track, *whole), "{what}: {p:?}");
+        assert_eq!((p.start, p.end), (Tick::ZERO, R.tick_of(48)), "{what}");
+        for w in *words {
+            assert!(p.reason.contains(w), "{what}: {:?} lacks {w:?}", p.reason);
+        }
+        for t in crate::slow_paths::samples(p.start, p.end) {
+            assert_eq!(is_cpu_frame(&s.p, s.seq, t, RenderOptions::default(), DeviceCaps::ALL), *whole, "{what} at {t:?}");
+        }
+    }
+    // a device without an effect stage runs no adjustment layer
+    let (s, ..) = ocean_under_adjustment();
+    let list = crate::slow_paths::slow_paths(&s.p, s.seq, Tick::ZERO, R.tick_of(48), DeviceCaps::NONE);
+    assert!(matches!(list.as_slice(), [p] if p.whole_frame && p.reason.contains("device")), "{list:?}");
+    // an HDR sequence: one entry for the whole range, whatever is on its tracks
+    let (mut s, ..) = ocean_under_adjustment();
+    s.p.sequence_mut(s.seq).unwrap().settings.color.wide_gamut = true;
+    let list = report(&s);
+    assert!(matches!(list.as_slice(), [p] if p.track == 0 && p.whole_frame && p.reason.contains("HDR")), "{list:?}");
+    // a transition into an adjustment layer, and the range asked about limits what is listed
+    let (mut s, below, adj) = ocean_under_adjustment();
+    clip(&mut s, below).duration = R.tick_of(48);
+    let it = clip(&mut s, adj);
+    it.start = R.tick_of(24);
+    it.duration = R.tick_of(24);
+    dissolve(&mut s, 1, None, Some(adj), 18);
+    let list = report(&s);
+    let [p] = list.as_slice() else { panic!("{list:?}") };
+    assert!(p.whole_frame && p.track == 2 && p.name == "cross_dissolve" && p.reason.contains("adjustment layer"), "{p:?}");
+    assert_eq!((p.start, p.end), (R.tick_of(18), R.tick_of(30)));
+    let part = crate::slow_paths::slow_paths(&s.p, s.seq, R.tick_of(20), R.tick_of(22), DeviceCaps::ALL);
+    assert!(matches!(part.as_slice(), [p] if (p.start, p.end) == (R.tick_of(20), R.tick_of(22))), "{part:?}");
+    assert_eq!(crate::slow_paths::slow_paths(&s.p, s.seq, R.tick_of(40), R.tick_of(48), DeviceCaps::ALL), Vec::new());
+}
+
+/// Nested sequences: one the compositor draws as layers reports what is inside it, one with
+/// effects of its own is reported itself, and hostile requests (an unknown sequence, a range that
+/// ends before it starts, a sequence nested in itself) return without panicking.
+#[test]
+fn the_cpu_report_looks_inside_nested_sequences_and_survives_hostile_requests() {
+    use crate::plan::DeviceCaps;
+    let outer = |inner: &Scene, change: &dyn Fn(&mut Scene, ClipId)| {
+        let mut s = Scene { p: inner.p.clone(), seq: inner.seq, map: inner.map.clone() };
+        let settings = s.p.sequence(inner.seq).unwrap().settings.clone();
+        let top = s.p.new_sequence("outer", settings, 1, 0, None);
+        s.seq = top;
+        let nest = place(&mut s.p, top, 0, inner.seq);
+        change(&mut s, nest);
+        s
+    };
+    let mut inner = scene(1);
+    let ocean = media(&mut inner.p, &mut inner.map, GeneratorSource::demo(DemoScene::OceanSunset));
+    let c = place(&mut inner.p, inner.seq, 0, ocean);
+    assert_eq!(report(&outer(&inner, &|_, _| {})), Vec::new(), "a nest of GPU layers");
+    let list = report(&outer(&inner, &|s, nest| fx(s, nest, "invert")));
+    assert!(matches!(list.as_slice(), [p] if !p.whole_frame && p.reason.contains("nested sequence with effects")), "{list:?}");
+    fx(&mut inner, c, "twirl");
+    let list = report(&outer(&inner, &|_, _| {}));
+    assert!(matches!(list.as_slice(), [p] if !p.whole_frame && p.reason.contains("inside this nested sequence") && p.reason.contains("Twirl")), "{list:?}");
+    // hostile requests
+    let s = outer(&inner, &|_, _| {});
+    assert_eq!(crate::slow_paths::slow_paths(&s.p, ocean, Tick::ZERO, R.tick_of(48), DeviceCaps::ALL), Vec::new(), "not a sequence");
+    assert_eq!(crate::slow_paths::slow_paths(&s.p, s.seq, R.tick_of(48), Tick::ZERO, DeviceCaps::ALL), Vec::new(), "a range that ends before it starts");
+    let _ = crate::slow_paths::slow_paths(&s.p, s.seq, Tick(i64::MIN), Tick(i64::MAX), DeviceCaps::ALL);
+    let mut cyclic = scene(1);
+    let own = cyclic.seq;
+    if let Some(ti) = cyclic.p.make_track_item(own, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, R.tick_of(48)), R) {
+        cyclic.p.sequence_mut(own).unwrap().video_tracks[0].items.push(ti);
+    }
+    let _ = report(&cyclic);
+}

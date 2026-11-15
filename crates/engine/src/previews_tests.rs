@@ -443,3 +443,43 @@ fn an_unwritable_preview_folder_fails_the_audio_job() {
     assert!(!s.previews.audio_segments(&s.project, s.state.active_sequence.unwrap()).iter().any(|g| s.previews.has_audio(&g.hash)));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `sequence.cpuReport`: nothing for a sequence the GPU draws, an entry with track, timecodes and
+/// a reason for an effect without a GPU version, and an error for hostile parameters.
+#[test]
+fn cpu_report_lists_what_renders_on_the_cpu() {
+    let (mut s, tint) = session("cpu-report");
+    let v = s.execute("sequence.cpuReport", json!({})).unwrap();
+    assert_eq!((v["count"].as_u64(), v["wholeFrameCount"].as_u64()), (Some(0), Some(0)), "{v}");
+    assert_eq!(v["device"], "assumed", "no monitor has composited a frame in this process");
+    let seq = s.state.active_sequence.unwrap();
+    let mut p = (*s.project).clone();
+    p.sequence_mut(seq).unwrap().find_item_mut(tint).unwrap().1.effects.push(find_effect("twirl").unwrap().instance());
+    s.project = Arc::new(p);
+    let r = FrameRate::FPS_24;
+    for params in [json!({}), json!({"item": seq.0}), json!({"start": 0, "end": r.tick_of(12).0})] {
+        let v = s.execute("sequence.cpuReport", params.clone()).unwrap();
+        let [e] = v["entries"].as_array().unwrap().as_slice() else { panic!("{params}: {v}") };
+        assert_eq!((e["track"].as_u64(), e["wholeFrame"].as_bool()), (Some(1), Some(false)), "{e}");
+        assert!(e["reason"].as_str().unwrap().contains("Twirl"), "{e}");
+        assert_eq!(e["start"], 0);
+        assert_eq!(e["startTimecode"], "00:00:00:00");
+        assert_eq!(e["end"].as_i64(), Some(if params.get("end").is_some() { r.tick_of(12).0 } else { r.tick_of(24).0 }));
+    }
+    // the second clip has no effect: asking only about its part lists nothing
+    let v = s.execute("sequence.cpuReport", json!({"start": r.tick_of(24).0})).unwrap();
+    assert_eq!(v["count"], 0, "{v}");
+    for bad in [
+        json!({"item": 999_999}),
+        json!({"item": "x"}),
+        json!({"item": -1}),
+        json!({"start": "soon"}),
+        json!({"start": 1.5}),
+        json!({"start": r.tick_of(30).0, "end": r.tick_of(10).0}),
+    ] {
+        assert!(s.execute("sequence.cpuReport", bad.clone()).is_err(), "{bad}");
+    }
+    // absurd but well-formed ranges are clamped to the sequence
+    let v = s.execute("sequence.cpuReport", json!({"start": i64::MIN, "end": i64::MAX})).unwrap();
+    assert_eq!(v["count"], 1, "{v}");
+}
