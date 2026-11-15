@@ -69,6 +69,8 @@ const OP_KEY_CHOKE: u32 = 108u;
 const OP_KEY_FINAL: u32 = 109u;
 const OP_MIX_BASE: u32 = 110u;
 const OP_LENS: u32 = 111u;
+const OP_EMBOSS: u32 = 112u;
+const OP_GLITCH: u32 = 113u;
 
 fn size() -> vec2<i32> {
     return vec2<i32>(i32(u.i0.y), i32(u.i0.z));
@@ -767,6 +769,17 @@ fn key_matte(o: vec4<f32>) -> f32 {
     return clamp((clamp(m, 0.0, 1.0) - u.p2.x) / (1.0 - u.p2.x), 0.0, 1.0);
 }
 
+// The picture `shift` pixels to the right of `p`, bilinear between the two texels of its row,
+// wrapping around sideways (`vfx::immersive`'s `sample_wrap` at a pixel centre).
+fn glitch_read(p: vec2<i32>, shift: f32) -> vec4<f32> {
+    let w = size().x;
+    let whole = floor(shift);
+    let x0 = p.x + i32(whole);
+    let a = ld(vec2(((x0 % w) + w) % w, p.y));
+    let b = ld(vec2((((x0 + 1) % w) + w) % w, p.y));
+    return a + (b - a) * (shift - whole);
+}
+
 fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
     let s = size();
     let pc = vec2<f32>(p) + 0.5;
@@ -929,6 +942,30 @@ fn pixel(op: u32, p: vec2<i32>) -> vec4<f32> {
             }
             let na = a * o.a;
             return vec4(l * na, na);
+        }
+        case OP_EMBOSS: {
+            // p0 = (dx, dy, contrast, blend)
+            let a = sample_clamped(pc.x + u.p0.x, pc.y + u.p0.y);
+            let b = sample_clamped(pc.x - u.p0.x, pc.y - u.p0.y);
+            let v = srgb_to_linear1(clamp(0.5 + (luma709(a.rgb) - luma709(b.rgb)) * u.p0.z * 2.0, 0.0, 1.0));
+            let o = ld(p);
+            return vec4(vec3(v * o.a * (1.0 - u.p0.w)) + o.rgb * u.p0.w, o.a);
+        }
+        case OP_GLITCH: {
+            // VR Digital Glitch: the row's (shift, glitching) from the table; p0 = (colour split,
+            // scanlines). A read at x + shift is, between the texels floor(shift) and the next, by
+            // the fraction of the shift: exact, as the CPU's `f64` position is.
+            let shift = textureLoad(tbl, vec2(0, p.y), 0).r;
+            let glitching = textureLoad(tbl, vec2(1, p.y), 0).r != 0.0;
+            var o = glitch_read(p, shift);
+            if glitching && u.p0.x > 0.0 {
+                o.r = glitch_read(p, shift + u.p0.x).r;
+                o.b = glitch_read(p, shift - u.p0.x).b;
+            }
+            if u.p0.y > 0.0 && (p.y & 1) == 1 {
+                o = vec4(o.rgb * (1.0 - u.p0.y * 0.6), o.a);
+            }
+            return o;
         }
         case OP_LENS: {
             // Lens Distortion: p0 = (curvature, centre x, centre y, half diagonal)

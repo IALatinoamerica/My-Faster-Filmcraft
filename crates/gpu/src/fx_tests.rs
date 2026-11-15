@@ -1219,3 +1219,27 @@ fn gpu_lens_distortion_matches_cpu() {
     );
     check_chains(1920, 1080, Tick::ZERO, &[(vec![effect("lens_distortion", &[("curvature", fl(-4.0))])], 2e-4)]);
 }
+
+/// Emboss and VR Digital Glitch (whose rows shift by whole and fractional pixels, wrap around
+/// and split their colours).
+#[test]
+fn gpu_emboss_and_digital_glitch_match_cpu() {
+    let blur = effect("gaussian_blur", &[("blurriness", fl(4.0))]);
+    let glitch =
+        effect("vr_digital_glitch", &[("amplitude", fl(100.0)), ("distortion", fl(9.0)), ("color", fl(80.0)), ("scanlines", fl(50.0)), ("seed", fl(7.0))]);
+    check_chains(
+        96,
+        54,
+        Tick::from_seconds_f64(0.7),
+        &[
+            (vec![effect("emboss", &[])], 4e-6),
+            (vec![effect("emboss", &[("direction", fl(110.0)), ("relief", fl(3.5)), ("contrast", fl(160.0)), ("blend", fl(35.0))])], 4e-6),
+            (vec![blur.clone(), effect("emboss", &[("relief", fl(40.0)), ("blend", fl(70.0))]), blur.clone()], 4e-6),
+            (vec![effect("vr_digital_glitch", &[])], 2e-5),
+            (vec![glitch.clone()], 2e-5),
+            (vec![effect("vr_digital_glitch", &[("amplitude", fl(0.0))])], 2e-6),
+            (vec![blur.clone(), glitch.clone(), blur], 2e-5),
+        ],
+    );
+    check_chains(1920, 1080, Tick::from_seconds_f64(0.7), &[(vec![glitch], 2e-4)]);
+}

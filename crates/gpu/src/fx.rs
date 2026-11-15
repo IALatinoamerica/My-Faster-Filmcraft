@@ -69,6 +69,8 @@ const OP_KEY_CHOKE: u32 = 108;
 const OP_KEY_FINAL: u32 = 109;
 const OP_MIX_BASE: u32 = 110;
 const OP_LENS: u32 = 111;
+const OP_EMBOSS: u32 = 112;
+const OP_GLITCH: u32 = 113;
 /// `effects::hash3`'s multiplier of the seed (the shader gets the product).
 const NOISE_SEED_MUL: u64 = 0x1656_67B1_9E37_79F9;
 
@@ -145,6 +147,29 @@ fn step(code: u32, i1: [u32; 4], p: &[f32]) -> Step {
         *d = *s;
     }
     Step { run: false, code, i1, p: q, combine: false, unsharp_blur: false, kernel: Vec::new(), plane: None, reads_orig: false, mix_base: false, table: None }
+}
+
+/// `values` (`w` × `h` of them, row by row) as a texture of one `R32Float` texel each.
+fn table_texture(device: &wgpu::Device, queue: &wgpu::Queue, values: &[f32], w: u32, h: u32) -> wgpu::TextureView {
+    let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
+    let t = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("filmcraft-fx-table"),
+        size,
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::R32Float,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+    queue.write_texture(
+        t.as_image_copy(),
+        &bytes,
+        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w.saturating_mul(4)), rows_per_image: Some(h) },
+        size,
+    );
+    t.create_view(&Default::default())
 }
 
 /// Texels a row of a kernel texture holds.
@@ -452,6 +477,15 @@ fn steps(op: &FxOp, w: u32, h: u32) -> Vec<Step> {
             }
         }
         FxOp::LensDistortion(l) => out.push(step(OP_LENS, [0; 4], &[l.k as f32, l.cx as f32, l.cy as f32, l.norm as f32])),
+        FxOp::Emboss(m) => out.push(step(OP_EMBOSS, [0; 4], &[m.dx, m.dy, m.contrast, m.blend])),
+        FxOp::DigitalGlitch(g) => {
+            // (no rows: the effect does nothing)
+            if g.rows.len() == h as usize * 2 && h > 0 {
+                let mut s = step(OP_GLITCH, [0; 4], &[g.cs, g.scan]);
+                s.table = Some((g.rows.clone(), 2, h));
+                out.push(s);
+            }
+        }
         FxOp::MixBase { weight, cov } => {
             // a plane of another size is a no-op, as on the CPU
             let fits = cov.as_ref().is_none_or(|c| (w as usize).checked_mul(h as usize) == Some(c.len()));
@@ -638,25 +672,7 @@ impl FxStage {
             self.planes.push(hit);
             return view;
         }
-        let size = wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 };
-        let t = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("filmcraft-fx-mask"),
-            size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-        let bytes: Vec<u8> = cov.iter().flat_map(|v| v.to_le_bytes()).collect();
-        queue.write_texture(
-            t.as_image_copy(),
-            &bytes,
-            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w.saturating_mul(4)), rows_per_image: Some(h) },
-            size,
-        );
-        let view = t.create_view(&Default::default());
+        let view = table_texture(device, queue, cov, w, h);
         if self.planes.len() >= MASK_PLANES {
             self.planes.remove(0);
         }
@@ -710,7 +726,13 @@ impl FxStage {
             };
             let table = match &s.table {
                 Some((values, tw, th)) if (*tw as usize).checked_mul(*th as usize) == Some(values.len()) && *tw <= max && *th <= max && !values.is_empty() => {
-                    Some(self.plane_texture(device, queue, values, *tw, *th))
+                    // a plane of the picture's size is kept for the frames that share it; a small
+                    // table changes from frame to frame and would push the planes out
+                    Some(if (*tw, *th) == (w, h) {
+                        self.plane_texture(device, queue, values, *tw, *th)
+                    } else {
+                        table_texture(device, queue, values, *tw, *th)
+                    })
                 }
                 _ => None,
             };

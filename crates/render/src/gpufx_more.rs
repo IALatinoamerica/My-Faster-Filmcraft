@@ -97,6 +97,141 @@ impl LensDistortion {
     }
 }
 
+/// Emboss: the luma difference of the picture read (bilinear, edges repeated) at ±(`dx`, `dy`)
+/// as a grey level, mixed with the picture by `blend`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Emboss {
+    pub dx: f32,
+    pub dy: f32,
+    pub contrast: f32,
+    pub blend: f32,
+}
+
+impl Emboss {
+    pub(crate) fn eval(e: &EffectInstance, cx: &FxCtx) -> Self {
+        let dir = (f(e, "direction", cx) as f64).to_radians();
+        let relief = f(e, "relief", cx) * cx.px_scale.max(0.25);
+        Self { dx: (dir.cos() as f32) * relief, dy: (-dir.sin() as f32) * relief, contrast: f(e, "contrast", cx) / 100.0, blend: f(e, "blend", cx) / 100.0 }
+    }
+
+    pub(crate) fn gpu_ok(&self) -> bool {
+        fin(&[self.dx, self.dy, self.contrast, self.blend])
+    }
+
+    pub(crate) fn apply(&self, img: &mut Image) {
+        let (dx, dy, contrast, blend) = (self.dx, self.dy, self.contrast, self.blend);
+        let src = img.clone();
+        let w = img.w;
+        if w == 0 || img.h == 0 {
+            return;
+        }
+        img.px.par_chunks_mut(w * 4).enumerate().for_each(|(y, row)| {
+            for x in 0..w {
+                let a = src.sample_bilinear_clamped(x as f32 + 0.5 + dx, y as f32 + 0.5 + dy);
+                let bq = src.sample_bilinear_clamped(x as f32 + 0.5 - dx, y as f32 + 0.5 - dy);
+                let v = srgb_to_linear((0.5 + (luma709(a[0], a[1], a[2]) - luma709(bq[0], bq[1], bq[2])) * contrast * 2.0).clamp(0.0, 1.0));
+                let o = src.get(x, y);
+                for k in 0..3 {
+                    row[x * 4 + k] = v * o[3] * (1.0 - blend) + o[k] * blend;
+                }
+            }
+        });
+    }
+}
+
+/// VR Digital Glitch on a monoscopic frame: `rows` holds, for each row of the picture, its
+/// sideways shift in pixels (wrapping around) and whether its band is glitching (1 or 0); a
+/// glitching row reads red and blue `cs` pixels to either side, and odd rows darken by
+/// `scan` × 0.6. Empty `rows`: the effect does nothing.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DigitalGlitch {
+    pub rows: std::sync::Arc<Vec<f32>>,
+    pub cs: f32,
+    pub scan: f32,
+}
+
+/// Tallest picture whose rows [`DigitalGlitch`] lists.
+const GLITCH_MAX_ROWS: usize = 1 << 15;
+
+impl DigitalGlitch {
+    /// None for a stereoscopic layout (each view glitches on its own: the CPU's work) and for a
+    /// picture taller than [`GLITCH_MAX_ROWS`].
+    pub(crate) fn eval(e: &EffectInstance, cx: &FxCtx, w: usize, h: usize) -> Option<Self> {
+        if chv(e, "frame_layout") != 0 || h > GLITCH_MAX_ROWS {
+            return None;
+        }
+        let amp = fv(e, "amplitude", cx) / 100.0;
+        let scan = fv(e, "scanlines", cx) / 100.0;
+        // (also a NaN amplitude: the effect returns before doing anything)
+        if amp <= 0.0 || amp.is_nan() {
+            return Some(Self { rows: Default::default(), cs: 0.0, scan: 0.0 });
+        }
+        let cplx = fv(e, "distortion", cx).max(1.0);
+        let rate = fv(e, "rate", cx) as f64;
+        let colour = fv(e, "color", cx) / 100.0;
+        let seed = fv(e, "seed", cx).max(0.0) as u64;
+        let tick = (cx.seconds * rate).floor() as i64;
+        let band = (h as f32 / cplx).max(1.0);
+        let mut rows = Vec::with_capacity(h * 2);
+        for y in 0..h {
+            let b = (y as f32 / band) as i64;
+            let active = crate::vfx::hash01(b, tick, 0, seed) < amp;
+            let shift = if active { (crate::vfx::hash01(b, tick, 1, seed) - 0.5) * w as f32 * 0.3 * amp } else { 0.0 };
+            rows.extend([shift, active as u8 as f32]);
+        }
+        Some(Self { rows: std::sync::Arc::new(rows), cs: colour * amp * 12.0, scan })
+    }
+
+    pub(crate) fn gpu_ok(&self) -> bool {
+        fin(&[self.cs, self.scan]) && fin(&self.rows)
+    }
+
+    /// `vfx::immersive`'s `sample_wrap`: bilinear, wrapping sideways, rows clamped.
+    fn sample_wrap(img: &Image, x: f64, y: f64) -> [f32; 4] {
+        let (w, h) = (img.w as isize, img.h as isize);
+        let fx = x - 0.5;
+        let fy = (y - 0.5).clamp(0.0, (h - 1) as f64);
+        let (x0, y0) = (fx.floor(), fy.floor());
+        let (tx, ty) = ((fx - x0) as f32, (fy - y0) as f32);
+        let (x0, y0) = (x0 as isize, y0 as isize);
+        let g = |xx: isize, yy: isize| img.get(xx.rem_euclid(w) as usize, yy.clamp(0, h - 1) as usize);
+        let (a, b, c, d) = (g(x0, y0), g(x0 + 1, y0), g(x0, y0 + 1), g(x0 + 1, y0 + 1));
+        let mut o = [0.0; 4];
+        for k in 0..4 {
+            let top = a[k] + (b[k] - a[k]) * tx;
+            let bot = c[k] + (d[k] - c[k]) * tx;
+            o[k] = top + (bot - top) * ty;
+        }
+        o
+    }
+
+    pub(crate) fn apply(&self, img: &mut Image) {
+        let (w, h) = (img.w, img.h);
+        if w == 0 || self.rows.len() != h * 2 {
+            return;
+        }
+        let (cs, scan) = (self.cs, self.scan);
+        let src = img.clone();
+        img.px.par_chunks_mut(w * 4).zip(self.rows.par_chunks(2)).enumerate().for_each(|(y, (row, r))| {
+            let (shift, active) = (r[0], r[1] != 0.0);
+            for x in 0..w {
+                let (fx, fy) = (x as f64 + 0.5 + shift as f64, y as f64 + 0.5);
+                let mut o = Self::sample_wrap(&src, fx, fy);
+                if active && cs > 0.0 {
+                    o[0] = Self::sample_wrap(&src, fx + cs as f64, fy)[0];
+                    o[2] = Self::sample_wrap(&src, fx - cs as f64, fy)[2];
+                }
+                if scan > 0.0 && y % 2 == 1 {
+                    for c in &mut o[..3] {
+                        *c *= 1.0 - scan * 0.6;
+                    }
+                }
+                row[x * 4..x * 4 + 4].copy_from_slice(&o);
+            }
+        });
+    }
+}
+
 /// Rounded Crop: the rectangle `x0..x1` × `y0..y1` with corner radius `rad`, an inward `feather`
 /// (0: a one-pixel edge) and a `border` band of colour `bc` (linear) inside the edge.
 #[derive(Clone, Debug, PartialEq)]
@@ -495,6 +630,11 @@ mod tests {
         let green = ParamValue::Color([0.0, 1.0, 0.0, 1.0]);
         let custom = ParamValue::Choice(3);
         vec![
+            ("emboss", vec![]),
+            ("emboss", vec![("direction", fl(110.0)), ("relief", fl(3.5)), ("contrast", fl(160.0)), ("blend", fl(35.0))]),
+            ("vr_digital_glitch", vec![]),
+            ("vr_digital_glitch", vec![("amplitude", fl(100.0)), ("distortion", fl(9.0)), ("color", fl(80.0)), ("scanlines", fl(50.0)), ("seed", fl(7.0))]),
+            ("vr_digital_glitch", vec![("amplitude", fl(0.0))]),
             ("lens_distortion", vec![]),
             ("lens_distortion", vec![("curvature", fl(-40.0)), ("h_decentering", fl(20.0)), ("v_decentering", fl(-35.0))]),
             ("lens_distortion", vec![("curvature", fl(75.0))]),
@@ -563,7 +703,9 @@ mod tests {
     fn hostile_parameters_are_declined_or_bounded() {
         let img = picture(40, 24);
         let bad = [f64::NAN, f64::INFINITY, -f64::INFINITY, 1e30, -1e30];
-        let numeric: [(&str, &[&str]); 6] = [
+        let numeric: [(&str, &[&str]); 8] = [
+            ("emboss", &["direction", "relief", "contrast", "blend"]),
+            ("vr_digital_glitch", &["amplitude", "distortion", "rate", "color", "scanlines", "seed"]),
             ("lens_distortion", &["curvature", "h_decentering", "v_decentering"]),
             ("luma_key", &["threshold", "cutoff"]),
             ("rounded_crop", &["left", "right", "radius", "feather", "border"]),

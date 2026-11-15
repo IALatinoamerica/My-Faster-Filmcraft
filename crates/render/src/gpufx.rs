@@ -255,6 +255,8 @@ pub enum FxOp {
     Noise(crate::gpufx_more::Noise),
     UltraKey(crate::gpufx_more::UltraKey),
     LensDistortion(crate::gpufx_more::LensDistortion),
+    Emboss(crate::gpufx_more::Emboss),
+    DigitalGlitch(crate::gpufx_more::DigitalGlitch),
 }
 
 /// Effect ids [`FxOp::eval`] understands (the GPU-capable standard effects).
@@ -302,6 +304,8 @@ pub const GPU_EFFECTS: &[&str] = &[
     "noise_legacy",
     "ultra_key",
     "lens_distortion",
+    "emboss",
+    "vr_digital_glitch",
 ];
 
 /// Pictures a Transform with its own shutter angle is blurred over.
@@ -583,6 +587,8 @@ impl FxOp {
             "noise" | "noise_legacy" => FxOp::Noise(crate::gpufx_more::Noise::eval(e, cx)),
             "ultra_key" => FxOp::UltraKey(crate::gpufx_more::UltraKey::eval(e, cx, w, h)),
             "lens_distortion" => FxOp::LensDistortion(crate::gpufx_more::LensDistortion::eval(e, cx, w, h)),
+            "emboss" => FxOp::Emboss(crate::gpufx_more::Emboss::eval(e, cx)),
+            "vr_digital_glitch" => FxOp::DigitalGlitch(crate::gpufx_more::DigitalGlitch::eval(e, cx, w, h)?),
             "horizontal_flip" => FxOp::HFlip,
             "vertical_flip" => FxOp::VFlip,
             "mirror" => {
@@ -805,6 +811,8 @@ impl FxOp {
             FxOp::Noise(n) => n.gpu_ok(),
             FxOp::UltraKey(k) => k.gpu_ok(),
             FxOp::LensDistortion(l) => l.gpu_ok(),
+            FxOp::Emboss(m) => m.gpu_ok(),
+            FxOp::DigitalGlitch(g) => g.gpu_ok(),
         }
     }
 
@@ -1127,6 +1135,8 @@ impl FxOp {
             FxOp::Noise(n) => n.apply(img),
             FxOp::UltraKey(k) => k.apply(img),
             FxOp::LensDistortion(l) => l.apply(img),
+            FxOp::Emboss(m) => m.apply(img),
+            FxOp::DigitalGlitch(g) => g.apply(img),
             FxOp::Mask { cov } => {
                 if cov.len().checked_mul(4) == Some(img.px.len()) {
                     crate::mask::scale_by(img, cov);
