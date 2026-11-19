@@ -327,6 +327,11 @@ impl filmcraft_render::SourceProvider for JobProvider {
         let s = self.inner.pool.monitor_source(item, self.inner.source(item)?);
         Some(Arc::new(TimedSource(s)))
     }
+    /// [`Self::source`] for a clip's own copy of the media (`filmcraft_render::readers`).
+    fn reader_source(&self, item: ItemId, reader: u64) -> Option<filmcraft_media::SharedSource> {
+        let s = self.inner.pool.monitor_source(item, self.inner.reader_source(item, reader)?);
+        Some(Arc::new(TimedSource(s)))
+    }
 }
 
 /// A GPU frame plan with its layers' texel conversions already done (off the UI thread).
@@ -1379,3 +1384,7 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+#[path = "frames_readers_tests.rs"]
+mod readers_tests;

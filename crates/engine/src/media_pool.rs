@@ -53,6 +53,8 @@ pub struct MediaPool {
     /// item → (reference key, source)
     sources: RwLock<HashMap<ItemId, (String, SharedSource)>>,
     proxies: RwLock<HashMap<ItemId, (String, SharedSource)>>,
+    /// Copies opened for the clips that read their media beside another clip ([`Self::reader_source`]).
+    readers: Mutex<Readers>,
     offline: Arc<RwLock<HashMap<ItemId, OfflineStatus>>>,
     use_proxies: AtomicBool,
     /// Per item: video frames that failed in a row in the monitors (see [`Self::monitor_source`]).
@@ -70,6 +72,7 @@ impl Default for MediaPool {
         Self {
             sources: RwLock::new(HashMap::new()),
             proxies: RwLock::new(HashMap::new()),
+            readers: Mutex::default(),
             offline: Arc::new(RwLock::new(HashMap::new())),
             use_proxies: AtomicBool::new(false),
             failures: Arc::default(),
@@ -181,6 +184,7 @@ impl MediaPool {
         self.sources.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
         self.proxies.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
         self.offline.write().unwrap_or_else(PoisonError::into_inner).remove(&item);
+        self.readers.lock().unwrap_or_else(PoisonError::into_inner).map.retain(|k, _| k.0 != item);
     }
 
     /// Record the media and proxy paths of `p`, loaded from the document at `document` (None: one
@@ -236,6 +240,7 @@ impl MediaPool {
         self.sources.write().unwrap_or_else(PoisonError::into_inner).clear();
         self.proxies.write().unwrap_or_else(PoisonError::into_inner).clear();
         self.offline.write().unwrap_or_else(PoisonError::into_inner).clear();
+        self.readers.lock().unwrap_or_else(PoisonError::into_inner).map.clear();
     }
 
     pub fn cached(&self, item: ItemId) -> Option<SharedSource> {
@@ -383,6 +388,57 @@ impl MediaPool {
         Some(self.unsupported_as_slate(item, path, src))
     }
 
+    /// A copy of `item`'s file (its proxy when `proxies` and it has one) for the clip that reads
+    /// it as `reader` (see `filmcraft_render::readers`): opened once and kept while it is among the
+    /// [`MAX_READERS`] used last. None when the item has no copy of its own to open (see
+    /// [`Self::own_source`]); the clip then reads the shared source.
+    pub fn reader_source(&self, p: &Project, item: ItemId, reader: u64, services: &dyn Services, proxies: bool) -> Option<SharedSource> {
+        let (media, m, _) = p.resolve_media(item)?;
+        let proxy = match &m.proxy {
+            Some(MediaRef::File { path }) if proxies && !m.offline => Some(path.clone()),
+            _ => None,
+        };
+        let key = match &proxy {
+            Some(path) => format!("proxy:{path}"),
+            None => media_key(m),
+        };
+        // opened under the lock: the frame's threads open each copy once
+        let mut readers = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        readers.clock = readers.clock.wrapping_add(1);
+        let clock = readers.clock;
+        if let Some((k, src, used)) = readers.map.get_mut(&(media, reader))
+            && *k == key
+        {
+            *used = clock;
+            return src.clone();
+        }
+        let src: Option<SharedSource> = match &proxy {
+            Some(path) => self.follow_media(path).and_then(|file| self.open_file(&file, services)).ok().map(|s| {
+                let src: SharedSource = Arc::new(ProxySource { proxy: s, info: m.info.clone(), audio_from: None });
+                src
+            }),
+            None => self.own_source(p, media, services),
+        };
+        // the host is still fetching the file's bytes (the browser): try again next time
+        if src.is_some() || !filmcraft_media::pending::is_set() {
+            readers.map.insert((media, reader), (key, src.clone(), clock));
+        }
+        let mut dropped = Vec::new();
+        while readers.map.len() > MAX_READERS {
+            let Some(oldest) = readers.map.iter().min_by_key(|(_, (_, _, used))| *used).map(|(k, _)| *k) else { break };
+            dropped.extend(readers.map.remove(&oldest));
+        }
+        drop(readers);
+        // closing a copy drops its decoder, which may wait for its frames in flight: off the lock
+        drop(dropped);
+        src
+    }
+
+    /// Copies [`Self::reader_source`] holds open now.
+    pub fn open_readers(&self) -> usize {
+        self.readers.lock().unwrap_or_else(PoisonError::into_inner).map.values().filter(|(_, src, _)| src.is_some()).count()
+    }
+
     fn set_offline(&self, item: ItemId, reason: OfflineReason, path: &str, error: &str) {
         self.offline.write().unwrap_or_else(PoisonError::into_inner).insert(item, OfflineStatus { reason, path: path.to_string(), error: error.to_string() });
     }
@@ -422,14 +478,26 @@ impl MediaPool {
 
     /// A render-side provider bound to a project snapshot (proxies when enabled).
     pub fn provider(self: &Arc<Self>, project: Arc<Project>, services: Arc<dyn Services>) -> PoolProvider {
-        PoolProvider { pool: self.clone(), project, services, full_res: false, used: None, own: None }
+        PoolProvider { pool: self.clone(), project, services, full_res: false, used: None, own: None, own_readers: Mutex::default() }
     }
 
     /// A provider that always reads full-resolution media (export).
     pub fn full_res_provider(self: &Arc<Self>, project: Arc<Project>, services: Arc<dyn Services>) -> PoolProvider {
-        PoolProvider { pool: self.clone(), project, services, full_res: true, used: None, own: None }
+        PoolProvider { pool: self.clone(), project, services, full_res: true, used: None, own: None, own_readers: Mutex::default() }
     }
 }
+
+/// Copies of files opened for clips that read their media beside another clip of the same media
+/// (`filmcraft_render::readers`): (media item, reader) → (reference key, copy, last use).
+#[derive(Default)]
+struct Readers {
+    map: HashMap<(ItemId, u64), (String, Option<SharedSource>, u64)>,
+    clock: u64,
+}
+
+/// Most copies [`MediaPool::reader_source`] keeps open. Each holds a file reader and, while in use,
+/// a decoder and decoded frames (the decoders' process-wide cap trims idle ones).
+const MAX_READERS: usize = 8;
 
 /// Implements [`filmcraft_render::SourceProvider`] over the pool for one project snapshot.
 pub struct PoolProvider {
@@ -442,6 +510,9 @@ pub struct PoolProvider {
     used: Option<Mutex<BTreeSet<ItemId>>>,
     /// Per media item, its own copy or None to share the pool's source ([`PoolProvider::own_sources`]).
     own: Option<Mutex<HashMap<ItemId, Option<SharedSource>>>>,
+    /// With [`PoolProvider::own_sources`]: per media item and reader, the job's own copy for that
+    /// reader ([`filmcraft_render::SourceProvider::reader_source`]).
+    own_readers: Mutex<HashMap<(ItemId, u64), Option<SharedSource>>>,
 }
 
 impl PoolProvider {
@@ -508,6 +579,41 @@ impl filmcraft_render::SourceProvider for PoolProvider {
             }
         }
         if self.full_res { self.pool.full_res_source(&self.project, item, &*self.services) } else { self.pool.source_for(&self.project, item, &*self.services) }
+    }
+
+    /// A copy of the media of its own for `reader` (see `filmcraft_render::readers`): the job's
+    /// own when it reads its own copies ([`PoolProvider::own_sources`]), else one the pool keeps.
+    /// The shared source when no copy can be opened.
+    fn reader_source(&self, item: ItemId, reader: u64) -> Option<SharedSource> {
+        if reader == 0 {
+            return self.source(item);
+        }
+        let copy = if self.own.is_some() {
+            if let Some(used) = &self.used {
+                used.lock().unwrap_or_else(PoisonError::into_inner).insert(item);
+            }
+            let media = self.project.resolve_media(item).map(|(m, _, _)| m);
+            media.and_then(|media| {
+                let mut own = self.own_readers.lock().unwrap_or_else(PoisonError::into_inner);
+                match own.get(&(media, reader)) {
+                    Some(src) => src.clone(),
+                    None => {
+                        let src = self.pool.own_source(&self.project, media, &*self.services);
+                        if src.is_some() || !filmcraft_media::pending::is_set() {
+                            own.insert((media, reader), src.clone());
+                        }
+                        src
+                    }
+                }
+            })
+        } else {
+            if let Some(used) = &self.used {
+                used.lock().unwrap_or_else(PoisonError::into_inner).insert(item);
+            }
+            let proxies = !self.full_res && self.pool.use_proxies();
+            self.pool.reader_source(&self.project, item, reader, &*self.services, proxies)
+        };
+        copy.or_else(|| self.source(item))
     }
 }
 

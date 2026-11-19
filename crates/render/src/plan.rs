@@ -405,7 +405,7 @@ fn media_requests(
         for item in showing.into_iter().filter(|i| i.enabled) {
             let is_media = project.item(item.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. }));
             let (Some(size), true) = (crate::source_size(project, item.item), is_media) else { continue };
-            let Some(src) = sources.source(item.item) else { continue };
+            let Some(src) = crate::readers::clip_source(project, seq, item, sources) else { continue };
             let motion = motion_matrix(seq, item, size, crate::source_par(project, item.item), item.effect_time_at(t));
             let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());
             let scale = (lin * opts.scale as f64).clamp(1.0 / 64.0, 1.0) as f32;
@@ -810,7 +810,7 @@ fn push_item(sc: Scene, item: &TrackItem, extra_opacity: f32, blend: Option<Blen
         return;
     }
     if let Some(chain) = gpu_chain(project, item, opts) {
-        let Some(src) = sources.source(item.item) else { return };
+        let Some(src) = crate::readers::clip_source(project, seq, item, sources) else { return };
         let Some(size) = crate::source_size(project, item.item) else { return };
         let motion = motion_matrix(seq, item, size, crate::source_par(project, item.item), mt);
         let lin = ((motion.a * motion.a + motion.b * motion.b).sqrt()).max((motion.c * motion.c + motion.d * motion.d).sqrt());

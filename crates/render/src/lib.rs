@@ -30,6 +30,7 @@ pub mod multicam;
 pub mod offline;
 pub mod plan;
 pub mod preview;
+pub mod readers;
 pub mod remix;
 pub mod scene;
 pub mod slow_paths;
@@ -52,6 +53,14 @@ pub use image::Image;
 /// Resolves project items to media sources (the engine owns the media pool).
 pub trait SourceProvider: Sync {
     fn source(&self, item: ItemId) -> Option<SharedSource>;
+    /// `item`'s media for the reader `reader` (non-zero, see [`readers::reader`]): a copy with a
+    /// decoder of its own where the provider can open one, so a clip that shows the file at the
+    /// same time as another clip, at another moment of it, does not seek their shared decoder back
+    /// and forth. By default the shared source.
+    fn reader_source(&self, item: ItemId, reader: u64) -> Option<SharedSource> {
+        let _ = reader;
+        self.source(item)
+    }
 }
 
 impl<F: Fn(ItemId) -> Option<SharedSource> + Sync> SourceProvider for F {
@@ -625,7 +634,7 @@ pub(crate) fn item_layer_unplaced(
         && !item.effect("opacity").is_some_and(|e| e.enabled && !e.masks.is_empty());
     let mut fetched = None;
     if allow_region && plain_media {
-        let (src, frame, n) = media_frame(item, t, sources, want, src_size)?;
+        let (src, frame, n) = media_frame(project, seq, item, t, sources, want, src_size)?;
         let (lw, lh) = frame.decimated_size(n);
         let px_scale = lw as f32 / src_size.0.max(1) as f32;
         let m =
@@ -705,8 +714,16 @@ fn plain_layer(frame: &Arc<VideoFrame>, n: usize, opacity: f32, blend: Blend) ->
 
 /// The source frame of a media clip at timeline `t` (at `want` of its size), and the decimation to
 /// convert it with.
-fn media_frame(item: &TrackItem, t: Tick, sources: &dyn SourceProvider, want: f32, src_size: (u32, u32)) -> Option<(SharedSource, Arc<VideoFrame>, usize)> {
-    let src = sources.source(item.item)?;
+fn media_frame(
+    project: &Project,
+    seq: &Sequence,
+    item: &TrackItem,
+    t: Tick,
+    sources: &dyn SourceProvider,
+    want: f32,
+    src_size: (u32, u32),
+) -> Option<(SharedSource, Arc<VideoFrame>, usize)> {
+    let src = readers::clip_source(project, seq, item, sources)?;
     let frame = src.video_frame(FrameRequest { time: video_source_time(item, t, src.info().frame_rate()), scale: want }).ok()?;
     let n = decimation(frame.width as f32, src_size.0 as f32 * want);
     Some((src, frame, n))
@@ -768,7 +785,7 @@ pub(crate) fn base_layer(
     let pi = project.item(item.item)?;
     Some(match &pi.kind {
         ItemKind::Media(_) | ItemKind::Subclip { .. } => {
-            let (src, frame, n) = media_frame(item, t, sources, want, src_size)?;
+            let (src, frame, n) = media_frame(project, seq, item, t, sources, want, src_size)?;
             media_image(project, seq, item, t, MediaFrame { src: &src, frame: &frame, n }, want)
         }
         ItemKind::Sequence(nested) => {
@@ -913,6 +930,10 @@ mod mixer_tests;
 
 #[cfg(test)]
 mod nest_tests;
+
+#[cfg(test)]
+#[path = "readers_tests.rs"]
+mod readers_tests;
 
 #[cfg(test)]
 #[path = "preview_tests.rs"]
