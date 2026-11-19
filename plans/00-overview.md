@@ -1,5 +1,8 @@
 # Round 3: masked effects on the GPU, and a report of what renders on the CPU
 
+Round 4 (2026-11-19: a file shown twice at once reads two copies; the render bar counts decodes
+side by side) was done without a plan; its numbers are in [results.md](results.md).
+
 Decided by Bruno on 2026-11-15. Implemented the same day (results in [results.md](results.md)). Rounds 1 and 2 are implemented; their plans were
 removed (they are in the Git history, last in commit `5efbb67f`) and their numbers stay in
 [results.md](results.md).

@@ -141,3 +141,53 @@ Checks run: `cargo fmt`; clippy with warnings as errors on `filmcraft-render`, `
 before) and `filmcraft-ui-egui --lib` (359 pass). After the window was removed only clippy and
 the `filmcraft-ui-egui` tests were run again. Not run: `cargo xtask ci`; the benchmark was not
 repeated after this stage (the change runs only when the project changes, not during playback).
+
+## Round 4: a file shown twice at once, and the render bar over stacked clips
+
+Decided and implemented on 2026-11-19, without a written plan. Project
+`285 Gemini 4 NEON - Segundo corte.fcproj`, sequence `04 Segundo corte` (60 fps), run on a copy.
+
+**Cause of the stall at 00:01:30:19.** `sequence.cpuReport` listed nothing: the GPU drew every
+layer. The same screen recording was on Video 1 and, 54 s further into it, on Video 2. One
+source per media item meant one decoder for both: it restarted at a keyframe at every request
+(82 restarts and 2 494 samples decoded in 4 s). Each such clip now reads a copy of its own
+(`crates/render/src/readers.rs`). It was the only such place in this sequence.
+
+`bench_playback --scenario project --res full`, frames shown, FilmCraft closed:
+
+| Start | Length | Before | After |
+|---|---|---|---|
+| 88 s | 4 s | 92 of 240 | 211 of 240 |
+| 90 s | 4 s | 5 of 240 | 203 of 240 |
+| 92 s | 4 s | 127 of 240 | 192 of 240 |
+| 86 s | 10 s | | 563 of 600 |
+| 80 s | 10 s | 219 of 240 (4 s) | 570 of 600 |
+| 96 s | 10 s | 219 of 240 (4 s) | 587 of 600 |
+| 300 s | 10 s | | 574 of 600 |
+
+**Render bar.** The bar was still red there: 28 ms against 25. Three HEVC layers had been
+counted at 6.5 ms each, one after another, and each title's text layer as a GPU effect. Now the
+decodes count once, as the slowest (they run side by side), and text layers are not effects.
+
+| `sequence.renderBar` | Before | After |
+|---|---|---|
+| Red segments | 26 (8.5 s) | 0 |
+| Highest segment cost | 30.0 ms | 23.5 ms |
+| Time to compute the bar (`render_bar_timing`) | | 6.59 ms |
+
+Playback of stretches that were red, 10 s windows: 0 s 563, 184 s 504, 280 s 512 of 600. An
+ordinary stretch that was never red, 200 s, shows 521: the red ones play like the rest, whose
+small losses fall at cuts.
+
+Checks run: `cargo fmt`; clippy with warnings as errors on `filmcraft-render`, `filmcraft-gpu`,
+`filmcraft-engine` and `filmcraft-ui-egui`; tests of `filmcraft-render` (294 pass), `filmcraft-gpu`
+(64 pass), `filmcraft-codecs` (all pass), `filmcraft-ui-egui --lib` and `filmcraft-engine --lib`
+(the APV export test fails as before; counts in the last run below). Each new test failed
+without its change; the monitors' test was checked by removing `JobProvider::reader_source`. Not run: `cargo xtask ci`. Bruno checked playback in the running app; the corrected bar was
+reopened for him but not yet looked at.
+
+Last run of the checks of `UPDATING.md` section 4 (2026-11-19, after the tests of the copies
+were added): clippy with warnings as errors on all six crates it lists, clean; tests of
+`filmcraft-render` (294), `filmcraft-gpu` (64), `filmcraft-codecs` and `filmcraft-platform` all
+pass, `filmcraft-ui-egui --lib` 360 pass, `filmcraft-engine --lib` 908 pass and only the known
+APV export test fails.

@@ -80,6 +80,8 @@ are in the Git history). In short:
 | Report of what renders on the CPU | `sequence.cpuReport` lists, without decoding, the clips, adjustment layers and transitions the GPU does not draw, with track, time and reason. Bruno's agents use it. | `crates/render/src/slow_paths.rs` (ours entirely); `adjustment_fx`, `AdjustmentCpu`, `adjustment_cx`, `transition_cpu`, `note_device`, `noted_device` in `plan.rs`; `cpu_report_json` in `crates/engine/src/previews.rs` and its `query!` line in `crates/engine/src/commands.rs`; the `note_device` call in `crates/ui-egui/src/panels/monitor.rs`; `docs/control-protocol.md` |
 | Render bar that asks the planner | The red / yellow bar above the timeline (and what `Render Effects In to Out` renders) follows what this fork really sends to the CPU; upstream's estimate assumes every effect and adjustment layer is on the CPU. A red stretch's tooltip names the clip and the reason. | `gpu_fx_cost`, `gpu_layer_cost`, `cpu_layer_cost`, `layer_cost`, `estimate_cost`, `GPU_EFFECT_MS`, `GPU_GRADE_MS` in `crates/render/src/preview.rs`; `is_full_grade` in `slow_paths.rs`; `crates/ui-egui/src/cpu_report.rs` and its call in `crates/ui-egui/src/panels/timeline/ruler.rs`; one row at the end of `crates/ui-egui/src/i18n/es.tsv` |
 | Update notice that cannot install | A newer release shows in our own notice, whose "Update and Restart" button is always greyed out; upstream's prompt, which installs the official build over the fork, never opens. If upstream reworks `updates_ui.rs`, keep this: no check may hand a found release to the library's `Updater`. | `fork_updater`, `fork_notice`, `Found` and the test `a_found_release_shows_the_fork_notice_and_not_the_installing_prompt` in `crates/ui-egui/src/updates_ui.rs`; three rows at the end of `crates/ui-egui/src/i18n/es.tsv` |
+| A file shown twice at once reads two copies | A clip that shows a file at the same time as a clip below it (lower track, or earlier on its track through a transition), at moments more than 0.5 s apart, reads a copy of the file with a decoder of its own; the two used to share one decoder that jumped back and forth at every frame (a screen recording full frame plus the same recording as a zoomed inset: 5 frames shown of 240). Clips that show the same moments still share one. Exports do the same with their own copies. | `crates/render/src/readers.rs` and `readers_tests.rs` (ours entirely); `reader_source` in the trait `SourceProvider` and the `readers::clip_source` call in `media_frame` in `crates/render/src/lib.rs`; the two `readers::clip_source` calls in `plan.rs` (`media_requests`, the GPU branch of `push_item`); `reader_source`, `Readers`, `MAX_READERS`, the `readers` field and its lines in `remove` and `clear` of `MediaPool`, and `own_readers` and `reader_source` of `PoolProvider` in `crates/engine/src/media_pool.rs`; `reader_source` of `JobProvider` in `crates/ui-egui/src/frames.rs`. Tests: `crates/render/src/readers_tests.rs` (which clip gets a copy), `crates/engine/src/readers_tests.rs` and `open_readers` in `media_pool.rs` (the pool opens, keeps and bounds the copies), `crates/ui-egui/src/frames_readers_tests.rs` (the monitors pass the copy on), each with its `mod` line in `crates/engine/src/lib.rs` and at the end of `frames.rs` |
+| Render bar: decodes side by side, titles are not effects | The bar counts the decode of a frame's media clips once, as the slowest of them, because this fork decodes them at the same time (see "Sources fetched side by side"); upstream adds them up. The text and shape layers of a title are no longer priced as effects. Three stacked 1080p HEVC recordings under two titles at 60 fps were red (28 ms) and play in full. | `side_by_side_decode` and the decode lines of `estimate_cost` in `crates/render/src/preview.rs`; the `graphic::is_layer` filter in `gpu_fx_cost`; the test `layers_decoded_side_by_side_count_the_slowest_decode_and_titles_no_effects` in `preview_tests.rs` |
 | App icon | A gold owl, so the fork is told apart from the installed FilmCraft. | `assets/app-icon/hicolor/*/apps/ai.storyteller.filmcraft.png` |
 
 Each optimization has tests that compare it with the CPU renderer or count the work done. They
@@ -167,6 +169,15 @@ After a merge, conflict or not, check these collisions by hand, because Git cann
 - **Trait `VideoDecoder`** (`crates/codecs/src/video.rs`): our method `set_output_from` has a
   default body. A new upstream decoder needs nothing; a new upstream *wrapper* around a decoder
   must forward the call, as `hybrid.rs` does, or the seek gain is lost without any error.
+- **Trait `SourceProvider`** (`crates/render/src/lib.rs`): our method `reader_source` has a
+  default body that returns the shared source. A new upstream provider that *wraps* another (as
+  `JobProvider` wraps `PoolProvider`) must forward it, as `JobProvider` does, or a file shown
+  twice at once stalls again without any error. A new upstream place in `crates/render` that asks
+  `sources.source(item.item)` for a clip's *video frames* must ask `readers::clip_source` instead
+  (audio and frame-rate lookups keep `source`).
+- **`estimate_cost`** (`crates/render/src/preview.rs`): if upstream adds a new kind of layer cost
+  that includes a decode, our subtraction in `side_by_side` must still cover it, or the bar
+  turns red again over stacked clips.
 
 Do not use `unwrap`, `expect`, `panic!` or `unsafe` in a resolution (see AGENTS.md §0).
 
@@ -180,13 +191,23 @@ cargo build --release -p filmcraft -p filmcraft-cli
 cargo build --release -p filmcraft-ui-egui --example bench_playback
 cargo test --release -p filmcraft-render -p filmcraft-gpu -p filmcraft-codecs -p filmcraft-platform
 cargo test --release -p filmcraft-ui-egui --lib
-cargo clippy --release -p filmcraft-render -p filmcraft-gpu -p filmcraft-codecs -p filmcraft-platform -p filmcraft-ui-egui --all-targets -- -D warnings
+cargo test --release -p filmcraft-engine --lib
+cargo clippy --release -p filmcraft-render -p filmcraft-gpu -p filmcraft-codecs -p filmcraft-platform -p filmcraft-engine -p filmcraft-ui-egui --all-targets -- -D warnings
 ```
 
 The test build compiles code the app build does not, so a second round of `missing field`
 errors in test helpers is normal; fix them the same way.
 
-Every test must pass. A failing test in one of our areas means the merge broke an optimization
+`filmcraft-engine` holds parts of our optimizations (the `sequence.cpuReport` command, the media
+pool's copies for clips that read a file twice at once), so its tests run too.
+
+One known failure, which is not ours and is not to be fixed: in `filmcraft-engine`,
+`export_tests::every_builtin_preset_exports_and_ffprobe_confirms` fails at "APV 422-10" because
+the `ffprobe` installed on this computer cannot read that codec. If it is the only failure and
+fails at that preset, note it in the report and carry on. If it fails anywhere else, treat it like any
+other failure.
+
+Every other test must pass. A failing test in one of our areas means the merge broke an optimization
 or upstream changed the picture it is compared with: find out which before changing the test.
 Do not loosen a tolerance to make a test pass. A failing test in an area we never touched should
 be checked against a clean copy of the release tag before it is set aside, and reported.
@@ -201,6 +222,51 @@ do not build while it runs.
 
 The test projects are outside the repository, in
 `/media/bruno/SSD 500 2 Linux/Software/Exporter test project/`. Never save or modify them.
+
+**First check that the media of each tested sequence is there.** A file that is missing or
+moved renders as a placeholder card, and a placeholder plays at full speed: the benchmark would
+then show good numbers that test nothing. Define this function once (from the repository root),
+then run it on a copy of each project in your scratch folder, with the sequence you benchmark:
+
+```sh
+check() {  # check <project copy> <sequence name>
+python3 - "$1" "$2" "$(target/release/filmcraft-cli --project "$1" exec media.status)" <<'EOF'
+import json, sys
+proj, name, status = sys.argv[1], sys.argv[2], json.loads(sys.argv[3])
+items = json.load(open(proj))["project"]["items"]
+seqs = [k for k, v in items.items() if v["name"] == name and "Sequence" in v["kind"]]
+if not seqs: sys.exit(f"no sequence named {name!r}")
+used, todo = set(), list(seqs)
+while todo:
+    k = todo.pop()
+    if k in used: continue
+    used.add(k)
+    kind = items.get(k, {}).get("kind", {})
+    if "Subclip" in kind: todo.append(str(kind["Subclip"]["parent"]))
+    if "Sequence" in kind:
+        for tr in kind["Sequence"]["video_tracks"]:
+            todo += [str(c["item"]) for c in tr["items"]]
+bad = [m for m in status if str(m["item"]) in used and m["status"] != "online"]
+for m in bad: print(m["status"], m["path"])
+sys.exit(1 if bad else 0)
+EOF
+}
+```
+
+```sh
+check "<copy of the project>" "EDIT_PR_277 News Nov 02"
+```
+
+It prints nothing and succeeds when every file that sequence plays (nested sequences and
+subclips included) is online. Files of the project that the sequence does not use are ignored.
+If it prints a file, stop: do not benchmark that
+project, and tell Bruno which project and which files. The fourth-round project's recordings are
+in a folder named `Obs Recordings TEMPORARY`, so they may be cleared at some point. Do not edit a
+project to point elsewhere.
+
+Sequences: `EDIT_PR_277 News Nov 02` for `FULL TEST` and the `FX` projects of the five effects and
+Twirl; `EDIT_PR_282 News Nov 02` for `FULL TEST 02` and every `FX Color Grading` project;
+`04 Segundo corte` for `285 Gemini 4 NEON - Segundo corte`.
 
 ```sh
 P="/media/bruno/SSD 500 2 Linux/Software/Exporter test project/FULL TEST.fcproj"
@@ -247,6 +313,34 @@ second round of optimizations. Run the same `project` command on it; frames show
 `FX Color Grading CAM.fcproj` and `FX Color Grading ADJ.fcproj` (same sequence name, start 140)
 carry a Color Grading with every section in use: 559 and 561 with our work. Without it the whole
 effect renders on the CPU; a window that falls to a handful of frames means that was lost.
+
+`FX Color Grading Masked CAM.fcproj` and `FX Color Grading Masked ADJ.fcproj` (same sequence) are
+the same with a feathered mask on each Color Grading. They exercise effects limited by a mask of
+their own. Frames shown of 600:
+
+| Project | Start | With our work | Without |
+|---|---|---|---|
+| Masked CAM | 30 | 578 | 0 |
+| Masked CAM | 140 | 562 | 0 |
+| Masked ADJ | 140 | 555 | 0 |
+
+A window that falls to a handful of frames means masked effects went back to the CPU.
+
+A third project, `285 Gemini 4 NEON - Segundo corte.fcproj` (sequence `04 Segundo corte`),
+exercises the fourth round: from 90.3 s to 93.7 s the same screen recording is on Video 1 and,
+54 s further into it, on Video 2. Run the same `project` command on it; frames shown:
+
+| Start, length | What it exercises | With our work | Without |
+|---|---|---|---|
+| 90, `--seconds 4` | the recording shown twice at once | 203 of 240 | 5 of 240 |
+| 86, `--seconds 10` | the same, with the stretch before it | 563 of 600 | not measured |
+| 80, 96, 300 (`--seconds 10`) | ordinary stretches, for comparison | 570, 587, 574 of 600 | the same |
+
+A run at 90 that falls to a handful of frames means a file shown twice shares one decoder again
+(see the `SourceProvider` collision in section 3). Also read the bar, which needs no playback:
+`target/release/filmcraft-cli --project "<copy of the project>" exec sequence.renderBar` must
+list no `"state": "red"` segment for that sequence (26 red segments before the fourth round).
+Run it on a copy in the scratch folder: the projects are never modified.
 
 If upstream is now faster than us somewhere, that is not a reason to change anything; report it.
 
