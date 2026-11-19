@@ -417,6 +417,61 @@ fn the_estimate_follows_the_planner() {
     assert!(need == Need::Render && cost < 25.0, "{cost} ms");
 }
 
+/// Media clips decode side by side (`plan::prefetch_sources`), so a frame waits for the slowest
+/// decode, not the sum: two more recordings stacked on one add less than one recording costs on
+/// its own. The text of a title is its picture, not an effect: it adds nothing. Three 1080p HEVC
+/// recordings, one with a Color Grading, under two titles at 60 fps play in real time.
+#[test]
+fn layers_decoded_side_by_side_count_the_slowest_decode_and_titles_no_effects() {
+    let r = FrameRate::FPS_60;
+    // the cost of the first segment of a sequence with `recordings` stacked HEVC recordings and
+    // `titles` titles above them, each with a text layer when `text`
+    let cost = |recordings: usize, titles: usize, text: bool| {
+        let mut p = Project::new("r");
+        let mut info = GeneratorSource::new(Generator::ColorMatte { color: [1.0; 4] }, 1920, 1080, r, Tick(60 * TICKS_PER_SECOND)).info().clone();
+        info.kind = filmcraft_media::MediaKind::Movie;
+        if let Some(v) = info.video.as_mut() {
+            v.codec = "HEVC".into();
+        }
+        let rec = p.add_item(
+            "rec.mp4",
+            Label::Iris,
+            ItemKind::Media(Box::new(MediaClip {
+                media: MediaRef::File { path: "/nowhere/rec.mp4".into() },
+                info,
+                interpret: Default::default(),
+                mark_in: None,
+                mark_out: None,
+                markers: vec![],
+                offline: false,
+                proxy: None,
+                identity: None,
+            })),
+            None,
+        );
+        let title = p.add_item("Graphic", Label::Rose, ItemKind::Graphic { width: 1920, height: 1080, rate: r }, None);
+        let seq = p.new_sequence("s", SequenceSettings { width: 1920, height: 1080, frame_rate: r, ..Default::default() }, recordings + titles, 0, None);
+        let layers = std::iter::repeat_n(rec, recordings).chain(std::iter::repeat_n(title, titles));
+        for (track, item) in layers.enumerate() {
+            let mut ti = p.make_track_item(item, TrackKind::Video, Tick::ZERO, TimeRange::new(Tick::ZERO, r.tick_of(60)), r).unwrap();
+            if track == 0 {
+                ti.effects.push(find_effect("lumetri").unwrap().instance());
+            }
+            if item == title && text {
+                ti.effects.push(filmcraft_project::graphic::new_text_layer("TITLE", filmcraft_geom::Vec2::new(960.0, 540.0), 60.0));
+            }
+            p.sequence_mut(seq).unwrap().video_tracks[track].items.push(ti);
+        }
+        let s = video_segments(&p, seq);
+        (s[0].cost_ms, s[0].need)
+    };
+    let (one, _) = cost(1, 0, false);
+    let (three, _) = cost(3, 0, false);
+    assert!(three - one < one, "two more recordings add {} ms, one alone costs {one} ms", three - one);
+    assert_eq!(cost(3, 2, true).0, cost(3, 2, false).0, "a title's text costs nothing more");
+    assert_eq!(cost(3, 2, true).1, Need::Realtime);
+}
+
 fn cases_multiply() -> &'static dyn Fn(&mut filmcraft_project::TrackItem, &mut filmcraft_project::TrackItem) {
     &|_, adj| {
         let multiply = filmcraft_project::effect::BLEND_MODES.iter().position(|b| *b == "Multiply").unwrap() as u32;

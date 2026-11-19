@@ -504,11 +504,13 @@ const GPU_GRADE_MS: f64 = 10.0;
 /// The cost of the enabled standard effects of `it` when the effect stage runs them. The budget
 /// allows [`REALTIME_BUDGET`] frame durations because frames are rendered by jobs that run side
 /// by side; the passes of the effect stage run one after another on one device, so their time is
-/// counted against a single frame duration (scaled up by the same factor here).
+/// counted against a single frame duration (scaled up by the same factor here). The text and
+/// shape layers of a graphic are its picture, drawn once and cached ([`decode_cost_ms`]), not
+/// effects.
 fn gpu_fx_cost(project: &Project, seq: &Sequence, it: &TrackItem, t: Tick, px: f64) -> f64 {
     it.effects
         .iter()
-        .filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic))
+        .filter(|e| e.enabled && e.def().is_some_and(|d| !d.intrinsic) && !filmcraft_project::graphic::is_layer(e))
         .map(|e| if e.effect == "lumetri" && crate::slow_paths::is_full_grade(project, seq, it, e, t) { GPU_GRADE_MS * px } else { GPU_EFFECT_MS * px })
         .sum::<f64>()
         * REALTIME_BUDGET
@@ -562,19 +564,38 @@ fn layer_cost(project: &Project, seq: &Sequence, it: &TrackItem, (a, b): (Tick, 
     }
 }
 
+/// The decode cost of `it` when it is one of the media clips whose frames are fetched side by
+/// side before the frame is planned ([`crate::plan::prefetch_sources`]: media and subclips on the
+/// sequence's own tracks, transitions included), else None.
+fn side_by_side_decode(project: &Project, it: &TrackItem) -> Option<f64> {
+    project.item(it.item).is_some_and(|p| matches!(p.kind, ItemKind::Media(_) | ItemKind::Subclip { .. })).then(|| decode_cost_ms(project, it.item, 0))
+}
+
 /// The estimated cost of one frame of the segment from `a` to `b`, and whether something in it
 /// sends the whole frame to the CPU (the segment is then red whatever the sum).
+///
+/// The media clips of a frame decode at the same time, each on its own decoder
+/// ([`crate::plan::prefetch_sources`]), so the frame waits for the slowest of them, not for all
+/// of them in turn: their decode costs count once, as the largest, not as a sum.
 fn estimate_cost(project: &Project, seq: &Sequence, layers: &[Layer], span: (Tick, Tick)) -> (f64, bool) {
     let px = (seq.settings.width as f64 * seq.settings.height as f64) / HD_PIXELS;
     // the device that composites the monitors; before it is known, one that runs every step
     let caps = crate::plan::noted_device().unwrap_or(crate::plan::DeviceCaps::ALL);
     let mut total = 0.0;
     let mut whole = crate::slow_paths::sequence_reason(seq).is_some();
+    let mut slowest_decode = 0.0f64;
+    let mut side_by_side = |it: &TrackItem, total: &mut f64| {
+        if let Some(d) = side_by_side_decode(project, it) {
+            *total -= d;
+            slowest_decode = slowest_decode.max(d);
+        }
+    };
     for l in layers {
         match l {
             Layer::Item(_, it) => {
                 let (cost, cpu) = layer_cost(project, seq, it, span, px, caps);
                 total += cost;
+                side_by_side(it, &mut total);
                 whole |= cpu;
             }
             Layer::Transition(ti, x, a, b) => {
@@ -582,6 +603,7 @@ fn estimate_cost(project: &Project, seq: &Sequence, layers: &[Layer], span: (Tic
                 for it in [a, b].into_iter().flatten() {
                     let (cost, cpu) = layer_cost(project, seq, it, span, px, caps);
                     total += if on_cpu { cpu_layer_cost(project, it, px) } else { cost };
+                    side_by_side(it, &mut total);
                     whole |= cpu;
                 }
                 total += if on_cpu { 12.0 * px } else { 1.0 };
@@ -589,7 +611,7 @@ fn estimate_cost(project: &Project, seq: &Sequence, layers: &[Layer], span: (Tic
             }
         }
     }
-    (total, whole)
+    (total + slowest_decode, whole)
 }
 
 /// A single clip that plays natively: no standard effects, untouched fixed effects, normal speed,
